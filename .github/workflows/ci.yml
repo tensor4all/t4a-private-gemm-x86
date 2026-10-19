@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -13,8 +14,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --all-targets
-      - name: Test
-        # The triangular-destination tests name the instruction set explicitly, so a runner
-        # with AVX-512 covers the 256-bit path as well, and an AVX2-only runner covers the
-        # path that used to be untested. The test prints a skip line when its set is absent.
-        run: cargo test --all-targets -- --nocapture
+      - name: Triangular destinations, both instruction sets
+        # The test names `InstrSet` explicitly, so an AVX-512 runner covers the 256-bit path
+        # (the one that used to write below the diagonal) and an AVX2-only runner covers it
+        # directly. Each test prints a skip line when its instruction set is absent.
+        run: cargo test --test triangular_dst -- --nocapture
+      - name: Full suite
+        # The crate's own suite is the author's and takes many minutes per shape; it is not
+        # what this branch changed, so it runs on demand rather than on every push.
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test
