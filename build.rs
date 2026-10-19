@@ -3108,6 +3108,12 @@ impl Target {
 										mov!(tmp, self.mask_sizeof() * self.len());
 										cmp!(diff, tmp);
 										cmovg!(diff, tmp);
+										// the count can go negative (the vector row is entirely
+										// past the diagonal): clamp it to an empty mask instead of
+										// reading before the mask table
+										xor!(tmp, tmp);
+										cmp!(diff, tmp);
+										cmovl!(diff, tmp);
 
 										kmov!(k(mask2_), [mask_ptr + 1 * diff]);
 										if i + 1 == m {
@@ -3123,6 +3129,11 @@ impl Target {
 										mov!(tmp, self.mask_sizeof() * self.len());
 										cmp!(diff, tmp);
 										cmovg!(diff, tmp);
+										// see the lower branch: a vector row entirely below the
+										// diagonal must not read the mask table backwards
+										xor!(tmp, tmp);
+										cmp!(diff, tmp);
+										cmovl!(diff, tmp);
 
 										kmov!(k(mask2_), [mask_ptr + 1 * diff]);
 										if i + 1 == m {

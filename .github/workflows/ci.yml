@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        # The triangular-destination tests name the instruction set explicitly, so a runner
+        # with AVX-512 covers the 256-bit path as well, and an AVX2-only runner covers the
+        # path that used to be untested. The test prints a skip line when its set is absent.
+        run: cargo test --all-targets -- --nocapture
