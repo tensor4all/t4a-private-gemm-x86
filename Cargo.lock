@@ -513,24 +513,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "private-gemm-x86"
-version = "0.1.22"
-dependencies = [
- "aligned-vec",
- "bytemuck",
- "crossbeam",
- "defer",
- "gemm",
- "interpol",
- "num_cpus",
- "rand",
- "raw-cpuid",
- "rayon",
- "spindle",
- "sysctl",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -764,6 +746,24 @@ dependencies = [
  "libc",
  "thiserror",
  "walkdir",
+]
+
+[[package]]
+name = "t4a-private-gemm-x86"
+version = "0.1.23"
+dependencies = [
+ "aligned-vec",
+ "bytemuck",
+ "crossbeam",
+ "defer",
+ "gemm",
+ "interpol",
+ "num_cpus",
+ "rand",
+ "raw-cpuid",
+ "rayon",
+ "spindle",
+ "sysctl",
 ]
 
 [[package]]
