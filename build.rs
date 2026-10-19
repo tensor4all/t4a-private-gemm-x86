@@ -927,7 +927,11 @@ const PREFIX: LazyLock<String> = LazyLock::new(|| {
 	if *PRETTY {
 		format!("[gemm.x86 v{VERSION_MAJOR}]")
 	} else {
-		format!("gemm_v{VERSION_MAJOR}")
+		// A fork prefix: the campaign's harness links this crate next to the upstream
+		// `private-gemm-x86` (faer-upstream still depends on it), and both define the same
+		// global assembly symbols. Renaming them here is enough - `src/lib.rs` includes the
+		// names this file generates.
+		format!("t4a_gemm_v{VERSION_MAJOR}")
 	}
 });
 const WORD: isize = 8;
