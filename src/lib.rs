@@ -414,6 +414,34 @@ pub unsafe fn millikernel_colmajor(
 	}
 }
 
+/// Claim the packing of a shared packed block. `flag`: 0 unclaimed, 1 a job is packing the block,
+/// 2 packed. Jobs that share a block (same row block for the lhs, same column block for the rhs)
+/// used to test only for 2, so jobs that started together (a lock-step fork-join) all packed the
+/// block at once, writing the same cache lines from several threads, which made the first
+/// microkernel calls of each job several times slower.
+///
+/// Returns 2 when the block is packed (read it through the packed pointer; the `Release` store
+/// of 2 by the packer pairs with the `Acquire` loads here). Returns anything else when the caller
+/// has to do the packing itself, and then must store 2 when done (`packable`: the caller has a
+/// source to pack from; without one it never claims and never waits). The packer never waits
+/// while it holds the claim, so there is no cycle, and a fork that runs the jobs one after
+/// another finds the block packed by the time it gets to the next.
+#[inline]
+fn claim_pack(flag: &AtomicU8, packable: bool) -> u8 {
+	let mut val = flag.load(Ordering::Acquire);
+	if val == 0 && packable {
+		val = match flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+			Ok(_) => 0,
+			Err(v) => v,
+		};
+	}
+	while val == 1 && packable {
+		core::hint::spin_loop();
+		val = flag.load(Ordering::Acquire);
+	}
+	val
+}
+
 pub unsafe fn millikernel_par(
 	thd_id: usize,
 	n_threads: usize,
@@ -492,7 +520,7 @@ pub unsafe fn millikernel_par(
 			}
 
 			if lhs != packed_lhs {
-				let val = pack_lhs_job[i].load(Ordering::Acquire);
+				let val = claim_pack(&pack_lhs_job[i], !lhs.is_null());
 
 				if val == 2 {
 					lhs = null();
@@ -505,7 +533,7 @@ pub unsafe fn millikernel_par(
 				rhs = rhs.wrapping_byte_offset(milli.rhs_cs * j as isize);
 			}
 			if rhs != packed_rhs {
-				let val = pack_rhs_job[j].load(Ordering::Acquire);
+				let val = claim_pack(&pack_rhs_job[j], !rhs.is_null());
 
 				if val == 2 {
 					rhs = null();
@@ -3530,5 +3558,64 @@ mod tests_c32_gather_scatter {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests_claim_pack {
+	use super::*;
+	use std::sync::atomic::AtomicUsize;
+
+	/// Jobs that start together: exactly one of them packs, the others see 2 only after the
+	/// packer's writes are done.
+	#[test]
+	fn one_packer_among_simultaneous_jobs() {
+		for _ in 0..200 {
+			let flag = AtomicU8::new(0);
+			let packers = AtomicUsize::new(0);
+			let data = AtomicUsize::new(0);
+			let arrived = AtomicUsize::new(0);
+			let n = 6;
+			std::thread::scope(|s| {
+				for _ in 0..n {
+					s.spawn(|| {
+						arrived.fetch_add(1, Ordering::SeqCst);
+						while arrived.load(Ordering::SeqCst) < n {
+							core::hint::spin_loop();
+						}
+						if claim_pack(&flag, true) != 2 {
+							packers.fetch_add(1, Ordering::SeqCst);
+							std::thread::sleep(std::time::Duration::from_micros(200));
+							data.store(7, Ordering::Relaxed);
+							flag.store(2, Ordering::Release);
+						} else {
+							assert_eq!(data.load(Ordering::Relaxed), 7);
+						}
+					});
+				}
+			});
+			assert_eq!(packers.load(Ordering::SeqCst), 1);
+		}
+	}
+
+	/// Jobs run one after another (no concurrency): nobody waits for a job that has not run yet.
+	#[test]
+	fn sequential_jobs_do_not_wait() {
+		let flag = AtomicU8::new(0);
+		assert_eq!(claim_pack(&flag, true), 0);
+		flag.store(2, Ordering::Release);
+		for _ in 0..3 {
+			assert_eq!(claim_pack(&flag, true), 2);
+		}
+	}
+
+	/// A job with nothing to pack from neither claims nor waits.
+	#[test]
+	fn not_packable_never_claims_or_waits() {
+		let flag = AtomicU8::new(0);
+		assert_eq!(claim_pack(&flag, false), 0);
+		assert_eq!(flag.load(Ordering::SeqCst), 0);
+		flag.store(1, Ordering::SeqCst);
+		assert_eq!(claim_pack(&flag, false), 1);
 	}
 }
