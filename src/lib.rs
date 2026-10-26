@@ -740,7 +740,7 @@ struct Milli {
 	sizeof: usize,
 }
 #[cfg(feature = "rayon")]
-struct MilliPar {
+struct MilliPar<'a> {
 	mr: usize,
 	nr: usize,
 	hyper: usize,
@@ -751,6 +751,19 @@ struct MilliPar {
 	pack_rhs_job: Box<[AtomicU8]>,
 	finished: AtomicUsize,
 	n_threads: usize,
+	/// `None`: fork on spindle's global pool; `Some`: fork on the caller's executor.
+	fork: Option<&'a dyn Fork>,
+}
+
+#[cfg(feature = "rayon")]
+impl MilliPar<'_> {
+	/// Run `f(j)` for `j` in `0..n_threads` and wait for all of them.
+	fn run(&self, f: &(dyn Fn(usize) + Sync)) {
+		match self.fork {
+			Some(fork) => fork.run(f),
+			None => spindle::for_each_raw(self.n_threads, f),
+		}
+	}
 }
 
 unsafe impl Millikernel for Milli {
@@ -802,7 +815,7 @@ unsafe impl<T> Sync for ForceSync<T> {}
 unsafe impl<T> Send for ForceSync<T> {}
 
 #[cfg(feature = "rayon")]
-unsafe impl Millikernel for MilliPar {
+unsafe impl Millikernel for MilliPar<'_> {
 	unsafe fn call(
 		&mut self,
 
@@ -861,7 +874,7 @@ unsafe impl Millikernel for MilliPar {
 			let rem = depth % self.n_threads;
 
 			if !wide {
-				spindle::for_each_raw(self.n_threads, |j| {
+				self.run(&|j| {
 					let mut start = j * div;
 					if j <= rem {
 						start += j;
@@ -896,7 +909,7 @@ unsafe impl Millikernel for MilliPar {
 
 		let gtid = AtomicUsize::new(0);
 
-		spindle::for_each_raw(self.n_threads, |_| unsafe {
+		self.run(&|_| unsafe {
 			loop {
 				let tid = gtid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 				if tid >= n {
@@ -1179,6 +1192,83 @@ pub enum DstKind {
 	Full,
 }
 
+/// An executor the parallel stages of [`gemm_with`] run on.
+///
+/// The kernel decomposes its own work (shared packing, a dynamic job queue) and only needs
+/// "run `f(j)` on `width` participants and wait". A [`Fork`] supplies those participants, so a
+/// caller that owns a fixed set of threads (a thread team, a pool of its own) can keep the
+/// kernel on them instead of on spindle's global pool.
+///
+/// # Contract
+///
+/// [`run`](Fork::run) calls `f(j)` exactly once for each `j` in `0..self.width()`, possibly
+/// concurrently, and returns only after every call has finished. The kernel calls `run` several
+/// times per product from one calling thread, never re-entrantly (a [`Fork`] need not be `Sync`:
+/// it is only ever used by the thread that called [`gemm_with`], and `f` never touches it), and
+/// expects the participants to see its writes made before `run` (and the caller to see theirs
+/// after it), as a fork-join barrier provides. A width of 0 or 1 is run inline by the kernel without calling `run`.
+///
+/// No call of `f` waits for another one, so a [`Fork`] may run the participants one after another
+/// on a single thread; it only has to be a correct fork-join, not a concurrent one.
+pub trait Fork {
+	/// Number of participants `run` provides.
+	fn width(&self) -> usize;
+
+	/// Call `f(j)` once for every `j` in `0..self.width()` and return when all have finished.
+	fn run(&self, f: &(dyn Fn(usize) + Sync));
+}
+
+/// Like [`gemm`], but the parallel stages run on `fork` (width `fork.width()`) instead of
+/// spindle's global pool, and spindle's lock is not taken. Width 1 runs inline without forking.
+///
+/// # Safety
+///
+/// The same as [`gemm`]; additionally `fork` must honour the [`Fork`] contract.
+pub unsafe fn gemm_with(
+	dtype: DType,
+	itype: IType,
+
+	instr: InstrSet,
+	nrows: usize,
+	ncols: usize,
+	depth: usize,
+
+	dst: *mut (),
+	dst_rs: isize,
+	dst_cs: isize,
+	dst_row_idx: *const (),
+	dst_col_idx: *const (),
+	dst_kind: DstKind,
+
+	beta: Accum,
+
+	lhs: *const (),
+	lhs_rs: isize,
+	lhs_cs: isize,
+	conj_lhs: bool,
+
+	real_diag: *const (),
+	diag_stride: isize,
+
+	rhs: *const (),
+	rhs_rs: isize,
+	rhs_cs: isize,
+	conj_rhs: bool,
+
+	alpha: *const (),
+
+	fork: &dyn Fork,
+) {
+	unsafe {
+		gemm_impl(
+			dtype, itype, instr, nrows, ncols, depth, dst, dst_rs, dst_cs, dst_row_idx, dst_col_idx, dst_kind, beta, lhs, lhs_rs, lhs_cs,
+			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
+			fork.width().max(1),
+			Some(fork),
+		)
+	}
+}
+
 pub unsafe fn gemm(
 	dtype: DType,
 	itype: IType,
@@ -1213,6 +1303,52 @@ pub unsafe fn gemm(
 	alpha: *const (),
 
 	n_threads: usize,
+) {
+	unsafe {
+		gemm_impl(
+			dtype, itype, instr, nrows, ncols, depth, dst, dst_rs, dst_cs, dst_row_idx, dst_col_idx, dst_kind, beta, lhs, lhs_rs, lhs_cs,
+			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
+			n_threads,
+			None,
+		)
+	}
+}
+
+unsafe fn gemm_impl(
+	dtype: DType,
+	itype: IType,
+
+	instr: InstrSet,
+	nrows: usize,
+	ncols: usize,
+	depth: usize,
+
+	dst: *mut (),
+	dst_rs: isize,
+	dst_cs: isize,
+	dst_row_idx: *const (),
+	dst_col_idx: *const (),
+	dst_kind: DstKind,
+
+	beta: Accum,
+
+	lhs: *const (),
+	lhs_rs: isize,
+	lhs_cs: isize,
+	conj_lhs: bool,
+
+	real_diag: *const (),
+	diag_stride: isize,
+
+	rhs: *const (),
+	rhs_rs: isize,
+	rhs_cs: isize,
+	conj_rhs: bool,
+
+	alpha: *const (),
+
+	n_threads: usize,
+	fork: Option<&dyn Fork>,
 ) {
 	let (sizeof, cplx) = match dtype {
 		DType::F32 => (4, false),
@@ -1355,7 +1491,12 @@ pub unsafe fn gemm(
 		let dst_row_idx = ForceSync(dst_row_idx);
 		let dst_col_idx = ForceSync(dst_col_idx);
 		let alpha = ForceSync(alpha);
+		// SAFETY (Send/Sync): a `Fork` is not required to be `Sync`. It is only reached from `f`,
+		// and `f` runs on the calling thread: directly when a fork is given, and under spindle's
+		// lock (where `fork` is `None`) otherwise.
+		let fork = ForceSync(fork);
 		let mut f = || {
+			let fork = { fork }.0;
 			let mut k = 0;
 			let mut beta = beta;
 			let mut lhs = { lhs }.0;
@@ -1499,8 +1640,9 @@ pub unsafe fn gemm(
 					assert!(rhs_size * size_of::<Page>() >= col_chunk[q - 2] * kc * sizeof);
 
 					unsafe {
-						kernel(
+						kernel_with(
 							n_threads,
+							fork,
 							microkernel,
 							pack,
 							mr,
@@ -1534,7 +1676,8 @@ pub unsafe fn gemm(
 				beta = Accum::Add;
 			}
 		};
-		if n_threads <= 1 {
+		if n_threads <= 1 || fork.0.is_some() {
+			// A caller-supplied executor owns its participants: no global pool lock.
 			f();
 		} else {
 			#[cfg(feature = "rayon")]
@@ -1548,6 +1691,69 @@ pub unsafe fn gemm(
 
 pub unsafe fn kernel(
 	n_threads: usize,
+	microkernel: &[unsafe extern "C" fn()],
+	pack: &[unsafe extern "C" fn()],
+
+	mr: usize,
+	nr: usize,
+	sizeof: usize,
+
+	lhs: *const (),
+	packed_lhs: *mut (),
+
+	rhs: *const (),
+	packed_rhs: *mut (),
+
+	nrows: usize,
+	ncols: usize,
+
+	row_chunk: &[usize],
+	col_chunk: &[usize],
+	lhs_rs: &[isize],
+	rhs_cs: &[isize],
+	packed_lhs_rs: &[isize],
+	packed_rhs_cs: &[isize],
+
+	row: usize,
+	col: usize,
+
+	pos: Position,
+	info: &MicrokernelInfo,
+) {
+	unsafe {
+		kernel_with(
+			n_threads,
+			None,
+			microkernel,
+			pack,
+			mr,
+			nr,
+			sizeof,
+			lhs,
+			packed_lhs,
+			rhs,
+			packed_rhs,
+			nrows,
+			ncols,
+			row_chunk,
+			col_chunk,
+			lhs_rs,
+			rhs_cs,
+			packed_lhs_rs,
+			packed_rhs_cs,
+			row,
+			col,
+			pos,
+			info,
+		)
+	}
+}
+
+/// [`kernel`] with an optional executor: `fork = Some(f)` runs the parallel stages on `f`
+/// (and `n_threads` must be `f.width()`), `None` runs them on spindle's pool.
+unsafe fn kernel_with(
+	n_threads: usize,
+	fork: Option<&dyn Fork>,
 	microkernel: &[unsafe extern "C" fn()],
 	pack: &[unsafe extern "C" fn()],
 
@@ -1600,6 +1806,7 @@ pub unsafe fn kernel(
 						pack_rhs_job: (0..max_j).map(|_| AtomicU8::new(0)).collect(),
 						finished: AtomicUsize::new(0),
 						n_threads,
+						fork,
 					}
 				};
 				&mut par
