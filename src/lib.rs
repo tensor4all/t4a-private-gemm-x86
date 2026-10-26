@@ -3826,3 +3826,114 @@ mod tests_claim_pack {
 		assert_eq!(claim_pack(&flag, false), 1);
 	}
 }
+
+#[cfg(all(test, feature = "rayon"))]
+mod tests_lockstep_fork {
+	use super::*;
+	use std::sync::atomic::AtomicUsize;
+
+	/// A fork whose participants all start together (a spin barrier before `f(j)`), the worst
+	/// case for jobs that share a packed row block: they used to pack it all at once.
+	struct Lockstep(usize);
+	impl Fork for Lockstep {
+		fn width(&self) -> usize {
+			self.0
+		}
+		fn run(&self, f: &(dyn Fn(usize) + Sync)) {
+			let arrived = AtomicUsize::new(0);
+			let n = self.0;
+			std::thread::scope(|s| {
+				for j in 0..n {
+					let arrived = &arrived;
+					s.spawn(move || {
+						arrived.fetch_add(1, Ordering::SeqCst);
+						while arrived.load(Ordering::SeqCst) < n {
+							core::hint::spin_loop();
+						}
+						f(j);
+					});
+				}
+			});
+		}
+	}
+
+	/// A fork that runs the participants one after another on the calling thread (allowed by the
+	/// [`Fork`] contract): the claim of a row block must not wait for a job that has not run yet.
+	struct Sequential(usize);
+	impl Fork for Sequential {
+		fn width(&self) -> usize {
+			self.0
+		}
+		fn run(&self, f: &(dyn Fn(usize) + Sync)) {
+			for j in 0..self.0 {
+				f(j);
+			}
+		}
+	}
+
+	fn product(m: usize, n: usize, k: usize, fork: Option<&dyn Fork>) -> Vec<f64> {
+		let instr = if std::arch::is_x86_feature_detected!("avx512f") {
+			InstrSet::Avx512
+		} else if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+			InstrSet::Avx256
+		} else {
+			return Vec::new();
+		};
+		let a: Vec<f64> = (0..m * k).map(|i| (i % 7) as f64 - 3.0).collect();
+		let b: Vec<f64> = (0..k * n).map(|i| (i % 5) as f64 - 2.0).collect();
+		let mut c = vec![0.0f64; m * n];
+		let alpha = 1.0f64;
+		unsafe {
+			macro_rules! go {
+				($f:path, $last:expr) => {
+					$f(
+						DType::F64,
+						IType::U64,
+						instr,
+						m,
+						n,
+						k,
+						c.as_mut_ptr() as *mut (),
+						1,
+						m as isize,
+						core::ptr::null(),
+						core::ptr::null(),
+						DstKind::Full,
+						Accum::Replace,
+						a.as_ptr() as *const (),
+						1,
+						m as isize,
+						false,
+						core::ptr::null(),
+						0,
+						b.as_ptr() as *const (),
+						1,
+						k as isize,
+						false,
+						&alpha as *const f64 as *const (),
+						$last,
+					)
+				};
+			}
+			match fork {
+				Some(f) => go!(gemm_with, f),
+				None => go!(gemm, 1),
+			}
+		}
+		c
+	}
+
+	#[test]
+	fn forks_that_start_together_or_one_by_one_agree_with_serial() {
+		for &(m, n, k) in &[(128, 128, 128), (130, 77, 50), (96, 200, 130), (33, 257, 64), (257, 40, 300)] {
+			let want = product(m, n, k, None);
+			if want.is_empty() {
+				return;
+			}
+			for _ in 0..40 {
+				assert_eq!(product(m, n, k, Some(&Lockstep(4))), want, "lockstep {m}x{n}x{k}");
+			}
+			assert_eq!(product(m, n, k, Some(&Sequential(4))), want, "sequential {m}x{n}x{k}");
+		}
+	}
+}
