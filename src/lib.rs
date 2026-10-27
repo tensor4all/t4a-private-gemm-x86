@@ -2861,9 +2861,7 @@ mod tests_c32_lower_add {
 		for alpha in [1.0.into(), 0.0.into(), c64::new(0.0, 3.5), c64::new(2.5, 3.5)] {
 			let alpha: c64 = alpha;
 			for m in 1..=127usize {
-				let m = 4005usize;
 				for n in (1..=4usize).chain([8, 32, 1024]) {
-					let n = 2usize;
 					for cs in [m, m.next_multiple_of(len)] {
 						for conj_lhs in [false, true] {
 							for conj_rhs in [false, true] {
@@ -2871,7 +2869,7 @@ mod tests_c32_lower_add {
 									let conj_different = conj_lhs != conj_rhs;
 
 									let acs = m.next_multiple_of(24);
-									let k = 4005usize;
+									let k = 1usize;
 									dbg!(m, n, k, diag_scale, conj_lhs, conj_rhs);
 
 									let packed_lhs: &mut [c64] = &mut *avec![0.0.into(); acs * k];
