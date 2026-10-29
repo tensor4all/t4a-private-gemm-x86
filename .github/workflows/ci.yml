@@ -19,6 +19,8 @@ jobs:
         # (the one that used to write below the diagonal) and an AVX2-only runner covers it
         # directly. Each test prints a skip line when its instruction set is absent.
         run: cargo test --test triangular_dst -- --nocapture
+      - name: Diagonal product with reversed depth, both instruction sets
+        run: cargo test --test diag_reversed_depth -- --nocapture
       - name: Full suite
         # The crate's own suite is the author's and takes many minutes per shape; it is not
         # what this branch changed, so it runs on demand rather than on every push.

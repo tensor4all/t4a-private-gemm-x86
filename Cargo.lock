@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "t4a-private-gemm-x86"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "aligned-vec",
  "bytemuck",

@@ -1362,7 +1362,7 @@ unsafe fn gemm_impl(
 	let mut rhs_cs = rhs_cs * sizeof as isize;
 	let mut dst_rs = dst_rs * sizeof as isize;
 	let mut dst_cs = dst_cs * sizeof as isize;
-	let real_diag_stride = diag_stride * sizeof as isize;
+	let mut real_diag_stride = diag_stride * sizeof as isize;
 
 	if nrows == 0 || ncols == 0 || (depth == 0 && beta == Accum::Add) {
 		return;
@@ -1381,6 +1381,8 @@ unsafe fn gemm_impl(
 
 	let mut rhs = rhs;
 	let mut conj_rhs = conj_rhs;
+
+	let mut real_diag = real_diag;
 
 	if dst_rs.unsigned_abs() > dst_cs.unsigned_abs() {
 		use core::mem::swap;
@@ -1411,6 +1413,13 @@ unsafe fn gemm_impl(
 
 		lhs_cs = -lhs_cs;
 		rhs_rs = -rhs_rs;
+
+		// The diagonal runs along the depth too: reverse it with the operands, so depth index
+		// `t` still meets `diag[t]`.
+		if !real_diag.is_null() {
+			real_diag = real_diag.wrapping_byte_offset((depth - 1) as isize * real_diag_stride);
+			real_diag_stride = -real_diag_stride;
+		}
 	}
 
 	let (microkernel, pack, mr, nr) = match (instr, dtype) {
