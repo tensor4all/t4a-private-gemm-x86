@@ -21,6 +21,11 @@ jobs:
         run: cargo test --test triangular_dst -- --nocapture
       - name: Diagonal product with reversed depth, both instruction sets
         run: cargo test --test diag_reversed_depth -- --nocapture
+      - name: Job tables borrowed from a caller-owned workspace
+        run: cargo test --test job_scratch
+      - name: A warm workspace allocates nothing
+        # this binary holds one `#[test]`, so no other test thread allocates while it counts
+        run: cargo test --test job_alloc -- --nocapture --test-threads=1
       - name: Full suite
         # The crate's own suite is the author's and takes many minutes per shape; it is not
         # what this branch changed, so it runs on demand rather than on every push.

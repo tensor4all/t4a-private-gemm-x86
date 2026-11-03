@@ -746,10 +746,10 @@ struct MilliPar<'a> {
 	hyper: usize,
 	sizeof: usize,
 
-	microkernel_job: Box<[AtomicU8]>,
-	pack_lhs_job: Box<[AtomicU8]>,
-	pack_rhs_job: Box<[AtomicU8]>,
-	finished: AtomicUsize,
+	/// Borrowed from the caller's [`MilliScratch`] when there is one, else from the
+	/// allocating fallback in `kernel_with`.
+	pack_lhs_job: &'a mut [AtomicU8],
+	pack_rhs_job: &'a mut [AtomicU8],
 	n_threads: usize,
 	/// `None`: fork on spindle's global pool; `Some`: fork on the caller's executor.
 	fork: Option<&'a dyn Fork>,
@@ -840,10 +840,8 @@ unsafe impl Millikernel for MilliPar<'_> {
 		let packed_rhs = ForceSync(packed_rhs);
 		let milli = ForceSync(milli);
 
-		self.microkernel_job.fill_with(|| AtomicU8::new(0));
 		self.pack_lhs_job.fill_with(|| AtomicU8::new(0));
 		self.pack_rhs_job.fill_with(|| AtomicU8::new(0));
-		self.finished = AtomicUsize::new(0);
 
 		let f = Ord::min(8, milli.0.micro.depth.div_ceil(64));
 		let l3 = CACHE_INFO[2].cache_bytes / f;
@@ -920,10 +918,11 @@ unsafe impl Millikernel for MilliPar<'_> {
 				millikernel_par(
 					tid,
 					n,
-					&self.microkernel_job,
+					// unread by `millikernel_par`; kept for its (unchanged) signature
+					&[],
 					&self.pack_lhs_job,
 					&self.pack_rhs_job,
-					&self.finished,
+					&AtomicUsize::new(0),
 					self.hyper,
 					self.mr,
 					self.nr,
@@ -1218,6 +1217,92 @@ pub trait Fork {
 	fn run(&self, f: &(dyn Fn(usize) + Sync));
 }
 
+/// Job tables of the parallel stages, borrowed from caller memory, for
+/// [`gemm_with_scratch`].
+///
+/// The kernel resets every entry at the start of each call, so the same bytes can be reused
+/// for any shape (the tables are only as long as the current product needs). Supply them from
+/// a workspace that is already paid for instead of letting each call allocate them.
+pub struct MilliScratch<'a> {
+	tables: &'a mut [AtomicU8],
+}
+
+impl<'a> MilliScratch<'a> {
+	/// Bytes [`new`](MilliScratch::new) needs for a product of at most `nrows x ncols`: one
+	/// byte per row block and one per column block, i.e. `nrows + ncols` in the worst case
+	/// (`mr = nr = 1`).
+	pub const fn required(nrows: usize, ncols: usize) -> usize {
+		nrows.saturating_add(ncols)
+	}
+
+	/// Borrow `mem` as the job tables. A shorter buffer is not an error: a call whose product
+	/// needs more than `mem.len()` bytes falls back to allocating them.
+	pub fn new(mem: &'a mut [u8]) -> MilliScratch<'a> {
+		// SAFETY: `AtomicU8` has the same size and bit validity as `u8` (its documented
+		// representation), so a `&mut [u8]` is a valid `&mut [AtomicU8]`, and every entry is
+		// reset before it is read.
+		MilliScratch {
+			tables: unsafe { &mut *(mem as *mut [u8] as *mut [AtomicU8]) },
+		}
+	}
+}
+
+/// Like [`gemm_with`], but the parallel job tables come from `scratch` instead of being
+/// allocated per call. Size the workspace with [`MilliScratch::required`]: a call whose scratch
+/// is at least that long, and whose packing storage the kernel has already grown, allocates
+/// nothing (a shorter scratch or a first, larger product falls back to allocating).
+///
+/// # Safety
+///
+/// The same as [`gemm_with`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_with_scratch(
+	dtype: DType,
+	itype: IType,
+
+	instr: InstrSet,
+	nrows: usize,
+	ncols: usize,
+	depth: usize,
+
+	dst: *mut (),
+	dst_rs: isize,
+	dst_cs: isize,
+	dst_row_idx: *const (),
+	dst_col_idx: *const (),
+	dst_kind: DstKind,
+
+	beta: Accum,
+
+	lhs: *const (),
+	lhs_rs: isize,
+	lhs_cs: isize,
+	conj_lhs: bool,
+
+	real_diag: *const (),
+	diag_stride: isize,
+
+	rhs: *const (),
+	rhs_rs: isize,
+	rhs_cs: isize,
+	conj_rhs: bool,
+
+	alpha: *const (),
+
+	fork: &dyn Fork,
+	scratch: MilliScratch<'_>,
+) {
+	unsafe {
+		gemm_impl(
+			dtype, itype, instr, nrows, ncols, depth, dst, dst_rs, dst_cs, dst_row_idx, dst_col_idx, dst_kind, beta, lhs, lhs_rs, lhs_cs,
+			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
+			fork.width().max(1),
+			Some(fork),
+			Some(scratch),
+		)
+	}
+}
+
 /// Like [`gemm`], but the parallel stages run on `fork` (width `fork.width()`) instead of
 /// spindle's global pool, and spindle's lock is not taken. Width 1 runs inline without forking.
 ///
@@ -1265,6 +1350,7 @@ pub unsafe fn gemm_with(
 			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
 			fork.width().max(1),
 			Some(fork),
+			None,
 		)
 	}
 }
@@ -1310,6 +1396,7 @@ pub unsafe fn gemm(
 			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
 			n_threads,
 			None,
+			None,
 		)
 	}
 }
@@ -1349,6 +1436,7 @@ unsafe fn gemm_impl(
 
 	n_threads: usize,
 	fork: Option<&dyn Fork>,
+	mut scratch: Option<MilliScratch<'_>>,
 ) {
 	let (sizeof, cplx) = match dtype {
 		DType::F32 => (4, false),
@@ -1652,6 +1740,7 @@ unsafe fn gemm_impl(
 						kernel_with(
 							n_threads,
 							fork,
+							scratch.as_mut(),
 							microkernel,
 							pack,
 							mr,
@@ -1733,6 +1822,7 @@ pub unsafe fn kernel(
 		kernel_with(
 			n_threads,
 			None,
+			None,
 			microkernel,
 			pack,
 			mr,
@@ -1759,10 +1849,13 @@ pub unsafe fn kernel(
 }
 
 /// [`kernel`] with an optional executor: `fork = Some(f)` runs the parallel stages on `f`
-/// (and `n_threads` must be `f.width()`), `None` runs them on spindle's pool.
+/// (and `n_threads` must be `f.width()`), `None` runs them on spindle's pool. `scratch`
+/// supplies the job tables of the parallel stages; without it (or when it is too short for
+/// this subproblem) they are allocated for the call.
 unsafe fn kernel_with(
 	n_threads: usize,
 	fork: Option<&dyn Fork>,
+	scratch: Option<&mut MilliScratch<'_>>,
 	microkernel: &[unsafe extern "C" fn()],
 	pack: &[unsafe extern "C" fn()],
 
@@ -1796,24 +1889,37 @@ unsafe fn kernel_with(
 		let mut seq = Milli { mr, nr, sizeof };
 		#[cfg(feature = "rayon")]
 		let mut par;
+		#[cfg(feature = "rayon")]
+		let mut owned = None;
 		kernel_imp(
 			#[cfg(feature = "rayon")]
 			if n_threads > 1 {
 				par = {
 					let max_i = nrows.div_ceil(mr);
 					let max_j = ncols.div_ceil(nr);
-					let max_jobs = max_i * max_j;
-					let c = max_i;
+
+					let (pack_lhs_job, pack_rhs_job): (&mut [AtomicU8], &mut [AtomicU8]) = match scratch {
+						// one buffer, split here: `gemm_impl` may have swapped the two
+						// dimensions, so the split point is per call
+						Some(s) if s.tables.len() >= max_i.saturating_add(max_j) => {
+							let (lhs, rhs) = s.tables.split_at_mut(max_i);
+							(lhs, &mut rhs[..max_j])
+						},
+						_ => {
+							let lhs = (0..max_i).map(|_| AtomicU8::new(0)).collect::<Vec<_>>();
+							let rhs = (0..max_j).map(|_| AtomicU8::new(0)).collect::<Vec<_>>();
+							let tables = owned.insert((lhs, rhs));
+							(tables.0.as_mut_slice(), tables.1.as_mut_slice())
+						},
+					};
 
 					MilliPar {
 						mr,
 						nr,
 						sizeof,
 						hyper: 1,
-						microkernel_job: (0..c * max_j).map(|_| AtomicU8::new(0)).collect(),
-						pack_lhs_job: (0..max_i).map(|_| AtomicU8::new(0)).collect(),
-						pack_rhs_job: (0..max_j).map(|_| AtomicU8::new(0)).collect(),
-						finished: AtomicUsize::new(0),
+						pack_lhs_job,
+						pack_rhs_job,
 						n_threads,
 						fork,
 					}
