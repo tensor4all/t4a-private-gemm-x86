@@ -52,14 +52,42 @@ fn cache_info() -> Option<[CacheInfo; 3]> {
 					read_trimmed(Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology/physical_package_id")))
 				}
 
-				/// One allowed CPU per physical package: the cache description of a package is read
-				/// from a single CPU of it, so the cost does not grow with the CPU count, and a
-				/// host whose packages differ still reports every package.
-				///
-				/// The packages of a machine are contiguous CPU ranges, so the first and the last
-				/// allowed CPU decide it in two reads; only when they disagree is every allowed CPU
-				/// looked at, which a single-socket host never pays.
+				/// The CPUs of `cpu`'s package, from `topology/package_cpus_list`.
+				fn package_cpus(cpu: usize) -> Option<Vec<usize>> {
+					let path = Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology/package_cpus_list"));
+					parse_cpu_list(&read_trimmed(path)?)
+				}
+
+				/// One allowed CPU per physical package, in ascending CPU order: the cache description
+				/// of a package is read from a single CPU of it, and a host whose packages differ still
+				/// reports every package.
 				fn package_representatives(cpus: &[usize]) -> Vec<usize> {
+					package_representatives_from_package_cpus(cpus).unwrap_or_else(|| package_representatives_from_ids(cpus))
+				}
+
+				/// The cheap route: `package_cpus_list` names every CPU of the representative's package,
+				/// so one read per package retires that whole package from the allowed set. The cost is
+				/// independent of how many CPUs are allowed, which `physical_package_id` per CPU is not
+				/// (faer#232, and faer#8 where a 128-CPU, two-package allocation cost 1,054 us instead
+				/// of 178 us).
+				fn package_representatives_from_package_cpus(cpus: &[usize]) -> Option<Vec<usize>> {
+					if cpus.is_empty() {
+						return None;
+					}
+					let mut remaining = cpus.to_vec();
+					let mut representatives = Vec::new();
+					while let Some(&cpu) = remaining.first() {
+						representatives.push(cpu);
+						let package = package_cpus(cpu)?;
+						remaining.retain(|c| package.binary_search(c).is_err());
+					}
+					Some(representatives)
+				}
+
+				/// The fallback for a kernel without `package_cpus_list` (older than 5.16): the packages
+				/// of a machine are contiguous CPU ranges, so the first and the last allowed CPU decide
+				/// it in two reads; only when they disagree is every allowed CPU looked at.
+				fn package_representatives_from_ids(cpus: &[usize]) -> Vec<usize> {
 					let (&first, &last) = (cpus.first().unwrap_or(&0), cpus.last().unwrap_or(&0));
 					if package_of(first) == package_of(last) {
 						return vec![first];
