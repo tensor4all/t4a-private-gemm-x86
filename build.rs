@@ -1,6 +1,6 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code, unused_labels, unused_macros)]
 
-const INFO_FLAGS: isize = 0 * WORD;
+const INFO_FLAGS: isize = 0;
 const INFO_DEPTH: isize = 1 * WORD;
 const INFO_LHS_RS: isize = 2 * WORD;
 const INFO_LHS_CS: isize = 3 * WORD;
