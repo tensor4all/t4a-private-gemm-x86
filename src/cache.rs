@@ -5,12 +5,184 @@ pub struct CacheInfo {
 	pub cache_line_bytes: usize,
 }
 
+/// Runs the process-wide cache probe now instead of inside the first product (faer#232).
+///
+/// The probe is a `OnceLock`, so this is idempotent and later calls do nothing; a program that
+/// wants the cost at start-up rather than in its first parallel region calls this first.
+pub fn init() {
+	let _ = *CACHE_INFO;
+}
+
 fn cache_info() -> Option<[CacheInfo; 3]> {
 	if !cfg!(miri) {
 		{
 			#[cfg(all(target_os = "linux", feature = "std"))]
 			{
 				use std::fs;
+				use std::path::Path;
+
+				/// The CPUs this process may run on, from `/proc/self/status`'s `Cpus_allowed_list`
+				/// (the `sched_getaffinity` set, without a `libc` dependency).
+				fn allowed_cpus() -> Option<Vec<usize>> {
+					let status = fs::read_to_string("/proc/self/status").ok()?;
+					let list = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+					parse_cpu_list(list.trim())
+				}
+
+				fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+					let mut cpus = Vec::new();
+					for item in list.split(',') {
+						match item.split_once('-') {
+							Some((start, end)) => {
+								let start = start.trim().parse::<usize>().ok()?;
+								let end = end.trim().parse::<usize>().ok()?;
+								cpus.extend(start..=end);
+							},
+							None => cpus.push(item.trim().parse::<usize>().ok()?),
+						}
+					}
+					(!cpus.is_empty()).then_some(cpus)
+				}
+
+				fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+					fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+				}
+
+				fn package_of(cpu: usize) -> Option<String> {
+					read_trimmed(Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology/physical_package_id")))
+				}
+
+				/// The CPUs of `cpu`'s package, from `topology/package_cpus_list`.
+				fn package_cpus(cpu: usize) -> Option<Vec<usize>> {
+					let path = Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology/package_cpus_list"));
+					parse_cpu_list(&read_trimmed(path)?)
+				}
+
+				/// One allowed CPU per physical package, in ascending CPU order: the cache description
+				/// of a package is read from a single CPU of it, and a host whose packages differ still
+				/// reports every package.
+				fn package_representatives(cpus: &[usize]) -> Vec<usize> {
+					package_representatives_from_package_cpus(cpus).unwrap_or_else(|| package_representatives_from_ids(cpus))
+				}
+
+				/// The cheap route: `package_cpus_list` names every CPU of the representative's package,
+				/// so one read per package retires that whole package from the allowed set. The cost is
+				/// independent of how many CPUs are allowed, which `physical_package_id` per CPU is not
+				/// (faer#232, and faer#8 where a 128-CPU, two-package allocation cost 1,054 us instead
+				/// of 178 us).
+				fn package_representatives_from_package_cpus(cpus: &[usize]) -> Option<Vec<usize>> {
+					if cpus.is_empty() {
+						return None;
+					}
+					let mut remaining = cpus.to_vec();
+					let mut representatives = Vec::new();
+					while let Some(&cpu) = remaining.first() {
+						representatives.push(cpu);
+						let package = package_cpus(cpu)?;
+						remaining.retain(|c| package.binary_search(c).is_err());
+					}
+					Some(representatives)
+				}
+
+				/// The fallback for a kernel without `package_cpus_list` (older than 5.16): the packages
+				/// of a machine are contiguous CPU ranges, so the first and the last allowed CPU decide
+				/// it in two reads; only when they disagree is every allowed CPU looked at.
+				fn package_representatives_from_ids(cpus: &[usize]) -> Vec<usize> {
+					let (&first, &last) = (cpus.first().unwrap_or(&0), cpus.last().unwrap_or(&0));
+					if package_of(first) == package_of(last) {
+						return vec![first];
+					}
+					let mut packages: Vec<Option<String>> = Vec::new();
+					let mut representatives = Vec::new();
+					for &cpu in cpus {
+						let package = package_of(cpu);
+						if !packages.contains(&package) {
+							packages.push(package);
+							representatives.push(cpu);
+						}
+					}
+					representatives
+				}
+
+				/// The online CPUs, from `/sys/devices/system/cpu/online`.
+				fn online_cpus() -> Option<usize> {
+					parse_cpu_list(&read_trimmed("/sys/devices/system/cpu/online")?).map(|cpus| cpus.len())
+				}
+
+				/// The threads per core of `cpu`, from its `thread_siblings_list`.
+				fn threads_per_core(cpu: usize) -> Option<usize> {
+					let path = Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology/thread_siblings_list"));
+					parse_cpu_list(&read_trimmed(path)?).map(|cpus| cpus.len())
+				}
+
+				/// The machine's physical cores, without `/proc/cpuinfo` (`num_cpus::get_physical`
+				/// reads and parses all of it, which is most of the probe's cost on a large host,
+				/// faer#232).
+				///
+				/// Two sysfs reads -- the online CPUs and the threads per core -- settle it while
+				/// every online core has the same number of threads, and the result then does not
+				/// grow with the CPU count. Otherwise the distinct (`physical_package_id`,
+				/// `core_id`) pairs of the allowed CPUs are counted, two reads per CPU.
+				fn physical_cores(allowed: &[usize]) -> Option<usize> {
+					if let (Some(online), Some(threads)) = (online_cpus(), threads_per_core(allowed.first().copied().unwrap_or(0))) {
+						return Some(online / threads.max(1)).filter(|cores| *cores > 0);
+					}
+					let mut pairs: Vec<(String, String)> = Vec::new();
+					for &cpu in allowed {
+						let topology = Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/topology"));
+						let pair = (
+							read_trimmed(topology.join("physical_package_id"))?,
+							read_trimmed(topology.join("core_id"))?,
+						);
+						if !pairs.contains(&pair) {
+							pairs.push(pair);
+						}
+					}
+					(!pairs.is_empty()).then_some(pairs.len())
+				}
+
+				/// `level`, the cache description and the width of `shared_cpu_list` of one
+				/// `cache/index*` directory, reading only the six files the probe needs.
+				fn read_index(index: &Path) -> Option<(usize, CacheInfo, usize)> {
+					if !matches!(read_trimmed(index.join("type"))?.as_str(), "Data" | "Unified") {
+						return None;
+					}
+					let level = read_trimmed(index.join("level"))?.parse::<usize>().ok()?;
+					let mut cache_info = CacheInfo {
+						associativity: 8,
+						cache_bytes: 0,
+						cache_line_bytes: 64,
+					};
+					if let Some(line) = read_trimmed(index.join("coherency_line_size")) {
+						cache_info.cache_line_bytes = line.parse().ok()?;
+					}
+					if let Some(ways) = read_trimmed(index.join("ways_of_associativity")) {
+						cache_info.associativity = ways.parse().ok()?;
+					}
+					let size = read_trimmed(index.join("size"))?;
+					cache_info.cache_bytes = if let Some(size) = size.strip_suffix('G') {
+						size.parse::<usize>().ok()? * 1024 * 1024 * 1024
+					} else if let Some(size) = size.strip_suffix('M') {
+						size.parse::<usize>().ok()? * 1024 * 1024
+					} else if let Some(size) = size.strip_suffix('K') {
+						size.parse::<usize>().ok()? * 1024
+					} else {
+						size.parse::<usize>().ok()?
+					};
+
+					let mut shared_count = 0;
+					for item in read_trimmed(index.join("shared_cpu_list"))?.split(',') {
+						match item.split_once('-') {
+							Some((start, end)) => {
+								let (start, end) = (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?);
+								shared_count += end + 1 - start;
+							},
+							None => shared_count += 1,
+						}
+					}
+					Some((level, cache_info, shared_count))
+				}
+
 				fn try_cache_info_linux() -> Result<[CacheInfo; 3], std::io::Error> {
 					let mut all_info = [CacheInfo {
 						associativity: 8,
@@ -18,132 +190,37 @@ fn cache_info() -> Option<[CacheInfo; 3]> {
 						cache_line_bytes: 64,
 					}; 3];
 
+					// the cache description of one CPU per package, not of every CPU
+					let cpus = allowed_cpus().unwrap_or_else(|| vec![0]);
 					let mut l1_shared_count = 1;
-					for cpu_x in fs::read_dir("/sys/devices/system/cpu")? {
-						let cpu_x = cpu_x?.path();
-						let Some(cpu_x_name) = cpu_x.file_name().and_then(|f| f.to_str()) else {
-							continue;
-						};
-						if !cpu_x_name.starts_with("cpu") {
-							continue;
-						}
-						let cache = cpu_x.join("cache");
+					for cpu in package_representatives(&cpus) {
+						let cache = Path::new("/sys/devices/system/cpu").join(format!("cpu{cpu}/cache"));
 						if !cache.is_dir() {
 							continue;
 						}
-						'index: for index_y in fs::read_dir(cache)? {
-							let index_y = index_y?.path();
-							if !index_y.is_dir() {
+						for index in fs::read_dir(cache)? {
+							let index = index?.path();
+							if !index.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with("index")) {
 								continue;
 							}
-							let Some(index_y_name) = index_y.file_name().and_then(|f| f.to_str()) else {
+							let Some((level, cache_info, shared_count)) = read_index(&index) else {
 								continue;
 							};
-							if !index_y_name.starts_with("index") {
-								continue;
-							}
-
-							let mut cache_info = CacheInfo {
-								associativity: 8,
-								cache_bytes: 0,
-								cache_line_bytes: 64,
-							};
-							let mut level: usize = 0;
-							let mut shared_count: usize = 0;
-
-							for entry in fs::read_dir(index_y)? {
-								let entry = entry?.path();
-								if let Some(name) = entry.file_name() {
-									let contents = fs::read_to_string(&entry)?;
-									let contents = contents.trim();
-									if name == "type" && !matches!(contents, "Data" | "Unified") {
-										continue 'index;
-									}
-									if name == "shared_cpu_list" {
-										for item in contents.split(',') {
-											if item.contains('-') {
-												let mut item = item.split('-');
-												let Some(start) = item.next() else {
-													continue 'index;
-												};
-												let Some(end) = item.next() else {
-													continue 'index;
-												};
-
-												let Ok(start) = start.parse::<usize>() else {
-													continue 'index;
-												};
-												let Ok(end) = end.parse::<usize>() else {
-													continue 'index;
-												};
-
-												shared_count += end + 1 - start;
-											} else {
-												shared_count += 1;
-											}
-										}
-									}
-
-									if name == "level" {
-										let Ok(contents) = contents.parse::<usize>() else {
-											continue 'index;
-										};
-										level = contents;
-									}
-
-									if name == "coherency_line_size" {
-										let Ok(contents) = contents.parse::<usize>() else {
-											continue 'index;
-										};
-										cache_info.cache_line_bytes = contents;
-									}
-									if name == "ways_of_associativity" {
-										let Ok(contents) = contents.parse::<usize>() else {
-											continue 'index;
-										};
-										cache_info.associativity = contents;
-									}
-									if name == "size" {
-										if contents.ends_with("G") {
-											let Ok(contents) = contents.trim_end_matches('G').parse::<usize>() else {
-												continue 'index;
-											};
-											cache_info.cache_bytes = contents * 1024 * 1024 * 1024;
-										} else if contents.ends_with("M") {
-											let Ok(contents) = contents.trim_end_matches('M').parse::<usize>() else {
-												continue 'index;
-											};
-											cache_info.cache_bytes = contents * 1024 * 1024;
-										} else if contents.ends_with("K") {
-											let Ok(contents) = contents.trim_end_matches('K').parse::<usize>() else {
-												continue 'index;
-											};
-											cache_info.cache_bytes = contents * 1024;
-										} else {
-											let Ok(contents) = contents.parse::<usize>() else {
-												continue 'index;
-											};
-											cache_info.cache_bytes = contents;
-										}
-									}
-								}
-							}
 							if level == 1 {
 								l1_shared_count = shared_count;
 							}
-							if level > 0 {
-								if cache_info.cache_line_bytes >= all_info[level - 1].cache_line_bytes {
-									all_info[level - 1].associativity = cache_info.associativity;
-									all_info[level - 1].cache_line_bytes = cache_info.cache_line_bytes;
-									all_info[level - 1].cache_bytes = cache_info.cache_bytes / shared_count;
-								}
+							// a level above L3 (an L4 on some hosts) has no slot here
+							if level > 0 && level <= 3 && cache_info.cache_line_bytes >= all_info[level - 1].cache_line_bytes {
+								all_info[level - 1].associativity = cache_info.associativity;
+								all_info[level - 1].cache_line_bytes = cache_info.cache_line_bytes;
+								all_info[level - 1].cache_bytes = cache_info.cache_bytes / shared_count.max(1);
 							}
 						}
 					}
 					for info in &mut all_info {
-						info.cache_bytes *= l1_shared_count;
+						info.cache_bytes *= l1_shared_count.max(1);
 					}
-					all_info[2].cache_bytes *= num_cpus::get_physical();
+					all_info[2].cache_bytes *= physical_cores(&cpus).unwrap_or_else(num_cpus::get_physical);
 
 					Ok(all_info)
 				}
@@ -376,3 +453,32 @@ impl core::ops::Deref for CacheInfoDeref {
 }
 
 pub static CACHE_INFO: CacheInfoDeref = CacheInfoDeref;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The probe is a `OnceLock`: `init` warms it once and later products do not repeat it, and
+	/// the levels the kernel reads are usable whatever the host reports (the deref floors them).
+	#[test]
+	fn init_warms_the_probe_once_and_the_levels_are_usable() {
+		init();
+		let warm = *CACHE_INFO;
+		init();
+		let again = *CACHE_INFO;
+		for level in 0..3 {
+			assert!(warm[level].cache_bytes > 0, "level {}: no size", level + 1);
+			assert!(warm[level].cache_line_bytes > 0, "level {}: no line size", level + 1);
+			assert_eq!(
+				(warm[level].cache_bytes, warm[level].associativity, warm[level].cache_line_bytes),
+				(again[level].cache_bytes, again[level].associativity, again[level].cache_line_bytes),
+				"level {}: a second init changed the description",
+				level + 1
+			);
+		}
+		assert!(
+			warm[0].cache_bytes <= warm[1].cache_bytes && warm[1].cache_bytes <= warm[2].cache_bytes,
+			"the levels are not ordered: {warm:?}"
+		);
+	}
+}

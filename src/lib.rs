@@ -21,6 +21,16 @@ pub struct Position {
 
 mod cache;
 
+/// Runs the process-wide cache probe now instead of inside the first product (faer#232).
+///
+/// The probe is a `OnceLock`, so this is cheap and idempotent, and later products do not repeat
+/// it. A program that would rather pay it at start-up than inside its first parallel region
+/// calls this first; nothing else has to call it.
+#[inline]
+pub fn init() {
+	cache::init();
+}
+
 const FLAGS_ACCUM: usize = 1 << 0;
 const FLAGS_CONJ_LHS: usize = 1 << 1;
 const FLAGS_CONJ_NEQ: usize = 1 << 2;
