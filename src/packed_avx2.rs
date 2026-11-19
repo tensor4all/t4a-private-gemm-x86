@@ -45,14 +45,17 @@ unsafe fn tile(a: *const f64, b: *const f64, c: *mut f64, ldc_bytes: usize, dept
 	let a = core::slice::from_raw_parts(a.cast::<[f64; MR]>(), depth);
 	let b = core::slice::from_raw_parts(b.cast::<[f64; NR]>(), depth);
 	let mut p = 0;
-	while p + 4 <= depth {
-		for offset in 0..4 {
-			step(&mut sums, &a[p + offset], &b[p + offset]);
+	let limit = depth / 8 * 8;
+	while p < limit {
+		for offset in 0..8 {
+			// p and limit are multiples of eight. All eight indices are
+			// below limit, which does not exceed either packed slice length.
+			step(&mut sums, a.get_unchecked(p + offset), b.get_unchecked(p + offset));
 		}
-		p += 4;
+		p += 8;
 	}
-	for t in p..depth {
-		step(&mut sums, &a[t], &b[t]);
+	for (ai, bi) in a[limit..].iter().zip(&b[limit..]) {
+		step(&mut sums, ai, bi);
 	}
 	if flags & FINISH == 0 {
 		partial.cast::<[[f64; MR]; NR]>().write(sums);
