@@ -28,9 +28,9 @@ Historical median times for one public multiplication in milliseconds on the Has
 
 [Assembly reference measurements](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9#issuecomment-7001924855)
 
-## Rust implementation
+## Initial Rust implementation
 
-The current tile holds 48 classical dot products in a fixed Rust array. Each depth step uses f64::mul_add. The compiler assigns SIMD registers. The Haswell entry point enables AVX2 and FMA locally so a generic x86-64 build can generate hardware FMA on that path. The 512-depth rounding groups and the scratch layout follow the assembly reference. The Rust tile replaces the hand-written assembly in this PR. CPU dispatch remains limited to Haswell.
+The initial Rust tile holds 48 classical dot products in a fixed Rust array. Each depth step uses f64::mul_add. The compiler assigns SIMD registers. The Haswell entry point enables AVX2 and FMA locally so a generic x86-64 build can generate hardware FMA on that path. The 512-depth rounding groups and the scratch layout follow the assembly reference. The Rust tile replaces the hand-written assembly in this PR. CPU dispatch remains limited to Haswell.
 
 A feasibility scan compared the assembly, Rust intrinsics and plain Rust on identical seeded inputs in four balanced rounds. At 511³, 513³ and 1024³, the plain Rust prototype took 3.2% more, 3.4% less and 1.5% more time than assembly, respectively (median within-round comparisons). The 465 × 513 × 48 SVD update took 14.9% more. All 16 input cases produced the same full-output hash across the three implementations. The isolated tile also compiled to an ARM64 object for Apple Silicon. ARM integration and runtime performance are unverified.
 

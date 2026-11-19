@@ -306,9 +306,10 @@ mod tests {
 		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 			return;
 		}
-		let (m, n, k) = (17usize, 13, 35);
-		let a: Vec<_> = (0..m * k).map(|p| (p % 11) as f64 - 5.).collect();
-		let b: Vec<_> = (0..n * k).map(|p| (p % 9) as f64 - 4.).collect();
+		let (m, n, k) = (17usize, 13, 2 * DEPTH_BLOCK + 1);
+		let a: Vec<_> = (0..m * k).map(|p| ((p % 11) as f64 - 5.) / 7.).collect();
+		let b: Vec<_> = (0..n * k).map(|p| ((p % 9) as f64 - 4.) / 11.).collect();
+		let alpha = -0.27;
 		// Exactly one packed tile per side. Each loop must cross its panel
 		// boundary. Sentinel slots surrounding the capacity are never scratch.
 		let left_len = MR * 16 + m.next_multiple_of(MR) * NR;
@@ -326,7 +327,7 @@ mod tests {
 				k,
 				c.as_mut_ptr(),
 				m,
-				-0.5,
+				alpha,
 				Accum::Add,
 				left.as_mut_ptr().add(1),
 				alen,
@@ -341,8 +342,13 @@ mod tests {
 		assert!(run(left_len, NR * 16));
 		for j in 0..n {
 			for i in 0..m {
-				let dot: f64 = (0..k).map(|p| a[i + p * m] * b[p + j * k]).sum();
-				assert_eq!(c[i + j * m], 1. - 0.5 * dot);
+				let mut expected = 1.0;
+				for start in (0..k).step_by(DEPTH_BLOCK) {
+					let dot = (start..k.min(start + DEPTH_BLOCK))
+						.fold(0.0, |sum, p| a[i + p * m].mul_add(b[p + j * k], sum));
+					expected += alpha * dot;
+				}
+				assert_eq!(c[i + j * m].to_bits(), expected.to_bits(), "row={i}, col={j}");
 			}
 		}
 		assert_eq!((left[0], left[left.len() - 1]), (19., 19.));

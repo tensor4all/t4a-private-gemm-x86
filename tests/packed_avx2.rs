@@ -72,12 +72,16 @@ fn classical_product_preserves_scaled_entries_and_padded_odd_edges() {
 			}
 			for j in 0..n {
 				for i in 0..m {
-					let sum = (0..k).fold(0.0, |v, p| a[i + p * lda].mul_add(b[p + j * ldb], v));
-					let want = if mode == Accum::Add {
-						sum.mul_add(alpha, initial[i + j * ldc])
-					} else {
-						sum * alpha
-					};
+					let mut want = initial[i + j * ldc];
+					for start in (0..k).step_by(512) {
+						let sum = (start..k.min(start + 512)).fold(0.0, |v, p| a[i + p * lda].mul_add(b[p + j * ldb], v));
+						let scaled = sum * alpha;
+						if start == 0 && mode == Accum::Replace {
+							want = scaled;
+						} else {
+							want += scaled;
+						}
+					}
 					assert_eq!(c[i + j * ldc], want, "i={i}, j={j}, k={k}, mode={mode:?}");
 				}
 				assert!(c[j * ldc + m..(j + 1) * ldc].iter().all(|x| *x == 42.));
