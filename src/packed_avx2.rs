@@ -198,4 +198,41 @@ mod tests {
 		assert_eq!((left[0], left[left.len() - 1]), (19., 19.));
 		assert_eq!((right[0], right[right.len() - 1]), (23., 23.));
 	}
+	// Adding two A entries would overflow, while every classical product is
+	// exactly two. Exercise this case through multiple packed depth panels.
+	#[test]
+	fn large_finite_inputs_with_small_multipliers() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		let (m, n, k) = (9, 7, 35);
+		let a = vec![2.0_f64.powi(1023); m * k];
+		let b = vec![f64::MIN_POSITIVE; k * n];
+		let mut c = vec![f64::NAN; m * n];
+		let mut left = [0.; MR * 16];
+		let mut right = [0.; NR * 16];
+		let used = unsafe {
+			multiply(
+				m,
+				n,
+				k,
+				a.as_ptr(),
+				m,
+				b.as_ptr(),
+				k,
+				c.as_mut_ptr(),
+				m,
+				1.,
+				Accum::Replace,
+				left.as_mut_ptr(),
+				left.len(),
+				right.as_mut_ptr(),
+				right.len(),
+				16,
+				256,
+			)
+		};
+		assert!(used);
+		assert!(c.iter().all(|&value| value == 2. * k as f64));
+	}
 }
