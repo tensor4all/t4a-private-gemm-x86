@@ -43,3 +43,11 @@ The generated four-step loop at efdb756 performed redundant bounds branches insi
 The eight-step candidate improved the equally weighted four-square time ratio by 2.69% in the median paired round, with eight wins in eight comparisons to efdb756. The four orders were 511, 512, 513 and 1024. At 511 it led both OpenBLAS builds by absolute median, with six of eight paired wins against the system build and five of eight against Julia's build. The other three orders still had slower medians than both builds. A four-round guard showed improvements at 513 × 1025 × 513 and 2048 cubed, with changes between +0.23% and +2.12% for three smaller padded layouts. All timed Rust results matched efdb756 bit for bit.
 
 The two-step variant was slower than efdb756 in all four square medians in the three-round screen. An eight-step variant with next-tile prefetch is undergoing a separate paired comparison. The release-shaped phase-specialization trial with Rust 1.84 compatible iterators was dropped after its 1024 median increased from 57.441 ms to 59.644 ms.
+
+## Explicit vector arithmetic across compiler versions
+
+The scalar Rust source in 473ca80 depends on LLVM to choose the vector grouping. On Haswell, Rust 1.99.1 generated vector spills in the depth loop. In a five-seed crossover with the same logical inputs, 1024 cubed took 228.538 ms on 1.99.1 and 63.471 ms on 1.96.0.
+
+The revised step loads two vectors of A, broadcasts each B value, and updates the twelve accumulators through Rust AVX2/FMA intrinsics. The machine code from both tested compilers keeps the vector sums in registers. The source retains the existing depth groups, scaling, and final add. Every full-result digest matched the previous draft across the paired measurements.
+
+On Rust 1.99.1, the median across eight fresh paired rounds improved by 73.15% across the four equally weighted orders. The 1024 median fell from 251.035 ms to 66.141 ms. System OpenBLAS took 62.075 ms and Julia's build took 62.694 ms. On Rust 1.96.0, the four-order paired median changed by −0.19%, with four wins in eight comparisons to the earlier draft. In both toolchains the 511 absolute median was lower than both libraries, while 512, 513 and 1024 remained slower.

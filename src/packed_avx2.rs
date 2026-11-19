@@ -1,4 +1,5 @@
 //! Sequential, packed 8 × 6 classical f64 GEMM for contiguous matrix rows.
+use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
 use crate::{Accum, DEPTH_BLOCK};
 
 const MR: usize = 8;
@@ -21,12 +22,18 @@ pub(super) fn haswell() -> bool {
 }
 
 // Each of the 48 accumulators follows the same depth order as the classical dot.
+// Keep the lane grouping explicit so the compiler keeps all twelve sums in YMM registers.
+// SAFETY: the caller must enable AVX2 and FMA.
 #[inline(always)]
-fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
+unsafe fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
+	let first = _mm256_loadu_pd(a.as_ptr());
+	let second = _mm256_loadu_pd(a.as_ptr().add(4));
 	for (col, &bj) in sums.iter_mut().zip(b) {
-		for (entry, &ai) in col.iter_mut().zip(a) {
-			*entry = ai.mul_add(bj, *entry);
-		}
+		let factor = _mm256_set1_pd(bj);
+		let low = _mm256_fmadd_pd(first, factor, _mm256_loadu_pd(col.as_ptr()));
+		let high = _mm256_fmadd_pd(second, factor, _mm256_loadu_pd(col.as_ptr().add(4)));
+		_mm256_storeu_pd(col.as_mut_ptr(), low);
+		_mm256_storeu_pd(col.as_mut_ptr().add(4), high);
 	}
 }
 
