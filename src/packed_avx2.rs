@@ -1,5 +1,5 @@
 //! Sequential, packed 8 × 6 classical f64 GEMM for contiguous matrix rows.
-use crate::Accum;
+use crate::{Accum, DEPTH_BLOCK};
 use core::arch::asm;
 
 const MR: usize = 8;
@@ -22,11 +22,11 @@ pub(super) fn haswell() -> bool {
 // the output. Each accumulator visits depth indices in increasing order.
 #[target_feature(enable = "avx2,fma")]
 #[inline(never)]
-unsafe fn tile(a: *const f64, b: *const f64, c: *mut f64, ldc: usize, depth: usize, alpha: f64, add: bool) {
+unsafe fn tile(a: *const f64, b: *const f64, c: *mut f64, ldc: usize, depth: usize, alpha: f64, partial: *mut f64, flags: usize) {
 	asm!(
 		include_str!("packed_avx2.s"),
 		a=inout(reg) a=>_, b=inout(reg) b=>_, c=inout(reg) c=>_, ld=in(reg) ldc,
-		k=inout(reg) depth=>_, count=out(reg) _, alpha=in(reg) alpha.to_bits(), add=in(reg) usize::from(add),
+		k=inout(reg) depth=>_, count=out(reg) _, alpha=in(reg) alpha.to_bits(), flags=in(reg) flags, partial=in(reg) partial,
 		out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _, out("ymm5") _,
 		out("ymm6") _, out("ymm7") _, out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
 		out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _, options(nostack)
@@ -104,40 +104,59 @@ pub(super) unsafe fn multiply(
 	// then occupies up to half of L2. Haswell's 32/256 KiB gives kc=192, mc=80.
 	let kc = (l1 / (MR + NR) * 2 / 3 / 16 * 16).max(16).min(k);
 	let mc = (l2 / kc / 2 / MR * MR).min(alen / kc / MR * MR);
-	let nc = blen / kc / NR * NR;
+	let row_pitch = m.next_multiple_of(MR);
+	let mut nc = blen / kc / NR * NR;
+	// The remainder of the A scratch holds raw accumulator tiles between
+	// cache panels. Fit an integral column band before touching the output.
+	let partials = pa.add(mc * kc);
+	let split = k.min(DEPTH_BLOCK) > kc;
+	if split {
+		nc = nc.min((alen - mc * kc) / row_pitch / NR * NR);
+	}
 	if mc == 0 || nc == 0 {
 		return false;
 	}
 	// Only valid source rows/columns are read. Padding in the packed edge
 	// tiles is initialized here; destination padding is never accessed.
-	for k0 in (0..k).step_by(kc) {
-		let depth = (k - k0).min(kc);
+	for group in (0..k).step_by(DEPTH_BLOCK) {
+		let group_depth = (k - group).min(DEPTH_BLOCK);
+		let add = group != 0 || beta == Accum::Add;
 		for j0 in (0..n).step_by(nc) {
 			let cols = (n - j0).min(nc);
-			pack_rhs(b.add(k0 + j0 * ldb), ldb, pb, cols, depth);
-			for i0 in (0..m).step_by(mc) {
-				let rows = (m - i0).min(mc);
-				pack_lhs(a.add(i0 + k0 * lda), lda, pa, rows, depth);
-				let add = k0 != 0 || beta == Accum::Add;
-				for j in (0..cols).step_by(NR) {
-					let width = (cols - j).min(NR);
-					for i in (0..rows).step_by(MR) {
-						let height = (rows - i).min(MR);
-						let ap = pa.add(i * depth);
-						let bp = pb.add(j * depth);
-						let out = c.add(i0 + i + (j0 + j) * ldc);
-						if height == MR && width == NR {
-							tile(ap, bp, out, 8 * ldc, depth, alpha, add);
-						} else {
-							let mut edge = [0.; MR * NR];
-							if add {
-								for col in 0..width {
-									core::ptr::copy_nonoverlapping(out.add(col * ldc), edge.as_mut_ptr().add(col * MR), height);
+			for offset in (0..group_depth).step_by(kc) {
+				let k0 = group + offset;
+				let depth = (group_depth - offset).min(kc);
+				let last = offset + depth == group_depth;
+				let flags = usize::from(add) | (usize::from(offset != 0) << 1) | (usize::from(last) << 2);
+				pack_rhs(b.add(k0 + j0 * ldb), ldb, pb, cols, depth);
+				for i0 in (0..m).step_by(mc) {
+					let rows = (m - i0).min(mc);
+					pack_lhs(a.add(i0 + k0 * lda), lda, pa, rows, depth);
+					for j in (0..cols).step_by(NR) {
+						let width = (cols - j).min(NR);
+						for i in (0..rows).step_by(MR) {
+							let height = (rows - i).min(MR);
+							let ap = pa.add(i * depth);
+							let bp = pb.add(j * depth);
+							let out = c.add(i0 + i + (j0 + j) * ldc);
+							let partial = if split {
+								partials.add(j * row_pitch + (i0 + i) * NR)
+							} else {
+								core::ptr::null_mut()
+							};
+							if !last || (height == MR && width == NR) {
+								tile(ap, bp, out, 8 * ldc, depth, alpha, partial, flags);
+							} else {
+								let mut edge = [0.; MR * NR];
+								if add {
+									for col in 0..width {
+										core::ptr::copy_nonoverlapping(out.add(col * ldc), edge.as_mut_ptr().add(col * MR), height);
+									}
 								}
-							}
-							tile(ap, bp, edge.as_mut_ptr(), 8 * MR, depth, alpha, add);
-							for col in 0..width {
-								core::ptr::copy_nonoverlapping(edge.as_ptr().add(col * MR), out.add(col * ldc), height);
+								tile(ap, bp, edge.as_mut_ptr(), 8 * MR, depth, alpha, partial, flags);
+								for col in 0..width {
+									core::ptr::copy_nonoverlapping(edge.as_ptr().add(col * MR), out.add(col * ldc), height);
+								}
 							}
 						}
 					}
@@ -157,12 +176,13 @@ mod tests {
 		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 			return;
 		}
-		let (m, n, k) = (17, 13, 35);
+		let (m, n, k) = (17usize, 13, 35);
 		let a: Vec<_> = (0..m * k).map(|p| (p % 11) as f64 - 5.).collect();
 		let b: Vec<_> = (0..n * k).map(|p| (p % 9) as f64 - 4.).collect();
 		// Exactly one packed tile per side. Each loop must cross its panel
 		// boundary. Sentinel slots surrounding the capacity are never scratch.
-		let mut left = vec![19.; MR * 16 + 2];
+		let left_len = MR * 16 + m.next_multiple_of(MR) * NR;
+		let mut left = vec![19.; left_len + 2];
 		let mut right = vec![23.; NR * 16 + 2];
 		let mut c = vec![1.; m * n];
 		let mut run = |alen, blen| unsafe {
@@ -188,7 +208,7 @@ mod tests {
 		};
 		assert!(!run(MR * 16 - 1, NR * 16));
 		assert!(!run(MR * 16, NR * 16 - 1));
-		assert!(run(MR * 16, NR * 16));
+		assert!(run(left_len, NR * 16));
 		for j in 0..n {
 			for i in 0..m {
 				let dot: f64 = (0..k).map(|p| a[i + p * m] * b[p + j * k]).sum();
@@ -209,7 +229,7 @@ mod tests {
 		let a = vec![2.0_f64.powi(1023); m * k];
 		let b = vec![f64::MIN_POSITIVE; k * n];
 		let mut c = vec![f64::NAN; m * n];
-		let mut left = [0.; MR * 16];
+		let mut left = [0.; MR * 16 + 2 * MR * NR];
 		let mut right = [0.; NR * 16];
 		let used = unsafe {
 			multiply(

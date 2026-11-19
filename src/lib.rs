@@ -3,6 +3,8 @@
 
 const M: usize = 4;
 const N: usize = 32;
+// Depth at which the classical kernel scales and commits each partial product.
+const DEPTH_BLOCK: usize = 512;
 
 use core::cell::RefCell;
 use core::ptr::{null, null_mut};
@@ -1541,7 +1543,7 @@ unsafe fn gemm_impl(
 	let m = nrows;
 	let n = ncols;
 
-	let kc = Ord::min(depth, 512);
+	let kc = Ord::min(depth, DEPTH_BLOCK);
 
 	let cache = *cache::CACHE_INFO;
 

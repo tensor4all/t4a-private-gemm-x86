@@ -21,9 +21,18 @@ vfmadd231pd ymm9, ymm13, ymm14
 vfmadd231pd ymm10, ymm12, ymm15
 vfmadd231pd ymm11, ymm13, ymm15
 .endm
+// Flags: add to C, resume raw accumulators, finish the arithmetic group.
+test {flags}, 2
+jz 7f
+.irp r,0,1,2,3,4,5,6,7,8,9,10,11
+    vmovupd ymm\r, [{partial}+32*\r]
+.endr
+jmp 3f
+7:
 .irp r,0,1,2,3,4,5,6,7,8,9,10,11
     vxorpd ymm\r, ymm\r, ymm\r
 .endr
+3:
 mov {count}, {k}
 shr {count}, 2
 jz 4f
@@ -46,9 +55,16 @@ add {b}, 48
 dec {k}
 jnz 5b
 6:
+test {flags}, 4
+jnz 7f
+.irp r,0,1,2,3,4,5,6,7,8,9,10,11
+    vmovupd [{partial}+32*\r], ymm\r
+.endr
+jmp 9f
+7:
 vmovq xmm12, {alpha}
 vbroadcastsd ymm12, xmm12
-test {add}, {add}
+test {flags}, 1
 jnz 8f
 .irp r,0,1,2,3,4,5,6,7,8,9,10,11
     vmulpd ymm13, ymm12, ymm\r
@@ -63,10 +79,12 @@ jmp 9f
 8:
 .irp r,0,1,2,3,4,5,6,7,8,9,10,11
     .if (\r % 2) == 0
-        vfmadd213pd ymm\r, ymm12, [{c}]
+        vmulpd ymm\r, ymm\r, ymm12
+        vaddpd ymm\r, ymm\r, [{c}]
         vmovupd [{c}], ymm\r
     .else
-        vfmadd213pd ymm\r, ymm12, [{c}+32]
+        vmulpd ymm\r, ymm\r, ymm12
+        vaddpd ymm\r, ymm\r, [{c}+32]
         vmovupd [{c}+32], ymm\r
         add {c}, {ld}
     .endif

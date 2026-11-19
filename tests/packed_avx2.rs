@@ -85,3 +85,70 @@ fn classical_product_preserves_scaled_entries_and_padded_odd_edges() {
 		}
 	}
 }
+
+#[test]
+fn arithmetic_groups_match_the_general_kernel_bit_for_bit() {
+	if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+		return;
+	}
+	let (m, n) = (89, 73);
+	let mut seed = 0x42B5E91u64;
+	let mut sample = || {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		(seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+	};
+	for k in [191usize, 193, 511, 512, 513, 1025] {
+		let a: Vec<_> = (0..m * k).map(|_| sample()).collect();
+		let b: Vec<_> = (0..k * n).map(|_| sample()).collect();
+		for mode in [Accum::Add, Accum::Replace] {
+			let alpha = -0.75_f64;
+			let mut c = vec![0.125_f64; m * n];
+			unsafe {
+				gemm(
+					DType::F64,
+					IType::U64,
+					InstrSet::Avx256,
+					m,
+					n,
+					k,
+					c.as_mut_ptr().cast(),
+					1,
+					m as isize,
+					null(),
+					null(),
+					DstKind::Full,
+					mode,
+					a.as_ptr().cast(),
+					1,
+					m as isize,
+					false,
+					null(),
+					0,
+					b.as_ptr().cast(),
+					1,
+					k as isize,
+					false,
+					(&alpha as *const f64).cast(),
+					1,
+				);
+			}
+			for j in 0..n {
+				for i in 0..m {
+					let mut expected = 0.125;
+					for start in (0..k).step_by(512) {
+						let dot = (start..k.min(start + 512)).fold(0.0, |sum, p| a[i + p * m].mul_add(b[p + j * k], sum));
+						let scaled = dot * alpha;
+						if start == 0 && mode == Accum::Replace {
+							expected = scaled;
+						} else {
+							expected += scaled;
+						}
+					}
+					assert_eq!(c[i + j * m].to_bits(), expected.to_bits(), "k={k}, i={i}, j={j}, mode={mode:?}");
+				}
+			}
+		}
+	}
+}
