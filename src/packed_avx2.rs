@@ -3,6 +3,9 @@ use crate::{Accum, DEPTH_BLOCK};
 
 const MR: usize = 8;
 const NR: usize = 6;
+const ADD: usize = 1;
+const RESUME: usize = 2;
+const FINISH: usize = 4;
 
 // Other AVX2 cores have different load ports and cache geometry. Scope this
 // implementation to the Intel family it was measured on.
@@ -27,25 +30,18 @@ fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
 	}
 }
 
-// Packed A and B contain depth complete rows of MR and NR elements. The
-// caller provides a full output tile (or an edge buffer) for the final panel.
-// Resuming reads the raw sums saved by the preceding panel of this group.
-// Enable hardware FMA for the runtime-dispatched tile in generic x86 builds.
+// A and B each contain depth full packed rows. RESUME loads the raw sums
+// saved by the preceding panel. FINISH needs a full writable output tile;
+// ADD also requires its entries to be initialized. Partial tiles use an
+// edge buffer in the caller. Keep the three update bits in one argument.
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[inline(never)]
-unsafe fn tile(
-	a: *const f64,
-	b: *const f64,
-	c: *mut f64,
-	ldc: usize,
-	depth: usize,
-	alpha: f64,
-	partial: *mut f64,
-	resume: bool,
-	last: bool,
-	add: bool,
-) {
-	let mut sums = if !resume { [[0.; MR]; NR] } else { *partial.cast::<[[f64; MR]; NR]>() };
+unsafe fn tile(a: *const f64, b: *const f64, c: *mut f64, ldc_bytes: usize, depth: usize, alpha: f64, partial: *mut f64, flags: usize) {
+	let mut sums = if flags & RESUME == 0 {
+		[[0.; MR]; NR]
+	} else {
+		*partial.cast::<[[f64; MR]; NR]>()
+	};
 	let a = core::slice::from_raw_parts(a.cast::<[f64; MR]>(), depth);
 	let b = core::slice::from_raw_parts(b.cast::<[f64; NR]>(), depth);
 	let mut p = 0;
@@ -58,15 +54,15 @@ unsafe fn tile(
 	for t in p..depth {
 		step(&mut sums, &a[t], &b[t]);
 	}
-	if !last {
+	if flags & FINISH == 0 {
 		partial.cast::<[[f64; MR]; NR]>().write(sums);
 	} else {
 		for (j, col) in sums.iter().enumerate() {
-			let dst = c.add(j * ldc);
+			let dst = c.byte_add(j * ldc_bytes);
 			for (i, &value) in col.iter().enumerate() {
 				let slot = dst.add(i);
 				let scaled = alpha * value;
-				slot.write(if add { scaled + slot.read() } else { scaled });
+				slot.write(if flags & ADD == 0 { scaled } else { scaled + slot.read() });
 			}
 		}
 	}
@@ -166,6 +162,7 @@ pub(super) unsafe fn multiply(
 				let k0 = group + offset;
 				let depth = (group_depth - offset).min(kc);
 				let last = offset + depth == group_depth;
+				let flags = usize::from(add) * ADD | usize::from(offset != 0) * RESUME | usize::from(last) * FINISH;
 				pack_rhs(b.add(k0 + j0 * ldb), ldb, pb, cols, depth);
 				for i0 in (0..m).step_by(mc) {
 					let rows = (m - i0).min(mc);
@@ -183,7 +180,7 @@ pub(super) unsafe fn multiply(
 								core::ptr::null_mut()
 							};
 							if !last || (height == MR && width == NR) {
-								tile(ap, bp, out, ldc, depth, alpha, partial, offset != 0, last, add);
+								tile(ap, bp, out, 8 * ldc, depth, alpha, partial, flags);
 							} else {
 								let mut edge = [0.; MR * NR];
 								if add {
@@ -191,7 +188,7 @@ pub(super) unsafe fn multiply(
 										core::ptr::copy_nonoverlapping(out.add(col * ldc), edge.as_mut_ptr().add(col * MR), height);
 									}
 								}
-								tile(ap, bp, edge.as_mut_ptr(), MR, depth, alpha, partial, offset != 0, last, add);
+								tile(ap, bp, edge.as_mut_ptr(), 8 * MR, depth, alpha, partial, flags);
 								for col in 0..width {
 									core::ptr::copy_nonoverlapping(edge.as_ptr().add(col * MR), out.add(col * ldc), height);
 								}

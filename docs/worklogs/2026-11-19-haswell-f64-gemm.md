@@ -18,16 +18,20 @@ The measurements use colmat 0ad25fe1, the old kernel at 8224897 and Rust 1.96 wi
 
 ## Assembly reference (9fadf8a)
 
-| Square | Time saved vs previous kernel | Time vs system OpenBLAS¹ | Time vs Julia OpenBLAS¹ | Wins vs previous kernel |
-|---:|---:|---:|---:|---:|
-| 511 | 13.1% | 0.2% | -1.2% | 8/8 |
-| 513 | 13.4% | 6.1% | 2.9% | 8/8 |
-| 1024 | 18.6% | 4.0% | 4.4% | 8/8 |
+Historical median times for one public multiplication in milliseconds on the Haswell host:
 
-¹ Negative values mean less time than the vendor. In the four-round shape sweep the 2048-square product took 14.1% less time than baseline. Full colmat SVD was 0.8% faster, 1.6% faster, 4.2% faster at orders 511, 513 and 1024, respectively. The 465 × 513 × 48 SVD update with its actual leading dimensions was 7.9% faster than system OpenBLAS. The 513 × 1025 × 513 product was 4.6% slower. These rectangular cells have four pairs each. Small-product results were mixed: the 64-square control took 13.9% longer than the previous build in four pairs. [All 22 cells and raw results](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9#issuecomment-7001924855) · [Reproduction driver](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9#issuecomment-7001711645)
+| Square | Previous colmat (ms) | Assembly (ms) | System OpenBLAS (ms) | Julia OpenBLAS (ms) |
+|---:|---:|---:|---:|---:|
+| 511 | 8.844 | 7.796 | 7.874 | 7.791 |
+| 513 | 9.356 | 8.235 | 7.830 | 7.879 |
+| 1024 | 75.051 | 61.266 | 58.711 | 58.713 |
+
+[Assembly reference measurements](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9#issuecomment-7001924855)
 
 ## Rust implementation
 
 The current tile holds 48 classical dot products in a fixed Rust array. Each depth step uses f64::mul_add. The compiler assigns SIMD registers. The Haswell entry point enables AVX2 and FMA locally so a generic x86-64 build can generate hardware FMA on that path. The 512-depth rounding groups and the scratch layout follow the assembly reference. The Rust tile replaces the hand-written assembly in this PR. CPU dispatch remains limited to Haswell.
 
 A feasibility scan compared the assembly, Rust intrinsics and plain Rust on identical seeded inputs in four balanced rounds. At 511³, 513³ and 1024³, the plain Rust prototype took 3.2% more, 3.4% less and 1.5% more time than assembly, respectively (median within-round comparisons). The 465 × 513 × 48 SVD update took 14.9% more. All 16 input cases produced the same full-output hash across the three implementations. The isolated tile also compiled to an ARM64 object for Apple Silicon. ARM integration and runtime performance are unverified.
+
+The first integration (0f1b354) passed the three panel-update indicators as separate arguments and passed the output stride in elements. In the resulting Haswell timing binary, the compiler spilled vector values to the stack inside the dot product. Its first guarded 1024-square round took 102.516 ms against 52.020 ms for system OpenBLAS. The revision restores the measured prototype's single flags word and byte stride. The Haswell timing binary again has vector FMAs without stack spills in the depth loop. Both versions use the same Rust arithmetic. See the current PR description for the head-specific comparison in milliseconds. [Draft PR #9](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9)
