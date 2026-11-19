@@ -20,6 +20,7 @@ pub struct Position {
 }
 
 mod cache;
+mod packed_avx2;
 
 /// Runs the process-wide cache probe now instead of inside the first product (faer#232).
 ///
@@ -1590,6 +1591,51 @@ unsafe fn gemm_impl(
 
 		let (packed_lhs, packed_rhs) = mem.split_at_mut(lhs_size);
 		let (packed_rhs, _) = packed_rhs.split_at_mut(rhs_size);
+		// Amortize packing over at least four microtiles in each direction
+		// and sixteen scalar updates per L2 element. Small/strided products
+		// continue through the general driver.
+		if instr == InstrSet::Avx256
+			&& dtype == DType::F64
+			&& n_threads == 1
+			&& dst_kind == DstKind::Full
+			&& dst_row_idx.is_null()
+			&& dst_col_idx.is_null()
+			&& real_diag.is_null()
+			&& dst_rs == 8
+			&& lhs_rs == 8
+			&& rhs_rs == 8
+			&& lhs_cs > 0
+			&& rhs_cs > 0
+			&& dst_cs > 0
+			&& m >= 32
+			&& n >= 24
+			&& depth >= 32
+			&& m.saturating_mul(n).saturating_mul(depth) > l2.saturating_mul(16)
+			&& packed_avx2::haswell()
+		{
+			let used = packed_avx2::multiply(
+				m,
+				n,
+				depth,
+				lhs.cast(),
+				lhs_cs as usize / 8,
+				rhs.cast(),
+				rhs_cs as usize / 8,
+				dst.cast(),
+				dst_cs as usize / 8,
+				*alpha.cast::<f64>(),
+				beta,
+				packed_lhs.as_mut_ptr().cast(),
+				core::mem::size_of_val(packed_lhs) / size_of::<f64>(),
+				packed_rhs.as_mut_ptr().cast(),
+				core::mem::size_of_val(packed_rhs) / size_of::<f64>(),
+				l1,
+				l2,
+			);
+			if used {
+				return;
+			}
+		}
 
 		let lhs = ForceSync(lhs);
 		let rhs = ForceSync(rhs);

@@ -2422,13 +2422,7 @@ impl Target {
 
 							reg!(depth_down);
 
-							// The AVX2 f64 full tile fills all twelve accumulator registers.
-							// Repeat depth steps on the same registers, retaining the FMA order.
-							let mut unroll0 = if bits == 256 && ty == Ty::F64 && m == 3 && n == 4 && !mask && !pack_lhs {
-								4
-							} else {
-								unroll
-							};
+							let mut unroll0 = unroll;
 							while unroll0 > 0 {
 								label!({
 									let nanokernel;
@@ -2444,8 +2438,7 @@ impl Target {
 								label!(nanokernel = _);
 
 								let bcst = bits == 512 && m == 1 && !pack_rhs;
-								for step in 0..unroll0 {
-									let iter = step % unroll;
+								for iter in 0..unroll0 {
 									for i in 0..m {
 										if !mask || i + 1 < m {
 											vmov!(zmm(m * n * unroll + i), [lhs + simd.sizeof() * i],);
@@ -2597,7 +2590,7 @@ impl Target {
 								if unroll0 == 1 {
 									dec!(depth_down);
 								} else {
-									sub!(depth_down, unroll0);
+									sub!(depth_down, unroll);
 								}
 								jnz!(nanokernel);
 								label!(loop_end = _);
