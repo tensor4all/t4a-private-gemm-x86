@@ -1,6 +1,6 @@
 //! Sequential, packed 8 × 6 classical f64 GEMM for contiguous matrix rows.
-use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
 use crate::{Accum, DEPTH_BLOCK};
+use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
 
 const MR: usize = 8;
 const NR: usize = 6;
@@ -163,8 +163,11 @@ pub(super) unsafe fn multiply(
 	}
 	// Only valid source rows/columns are read. Padding in the packed edge
 	// tiles is initialized here; destination padding is never accessed.
-	for group in (0..k).step_by(DEPTH_BLOCK) {
-		let group_depth = (k - group).min(DEPTH_BLOCK);
+	// Keep the final depth-one arithmetic group separate and update C by column.
+	let tail = k > 1 && k % DEPTH_BLOCK == 1;
+	let packed_k = k - usize::from(tail);
+	for group in (0..packed_k).step_by(DEPTH_BLOCK) {
+		let group_depth = (packed_k - group).min(DEPTH_BLOCK);
 		let add = group != 0 || beta == Accum::Add;
 		for j0 in (0..n).step_by(nc) {
 			let cols = (n - j0).min(nc);
@@ -209,12 +212,94 @@ pub(super) unsafe fn multiply(
 			}
 		}
 	}
+	if tail {
+		add_rank_one(m, n, a.add(packed_k * lda), b.add(packed_k), ldb, c, ldc, alpha);
+	}
 	true
+}
+
+// C is initialized by earlier arithmetic groups. The column views are disjoint
+// and valid for the stated dimensions, as in multiply.
+#[target_feature(enable = "avx2,fma")]
+#[inline(never)]
+unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: usize, c: *mut f64, ldc: usize, alpha: f64) {
+	use core::arch::x86_64::{_mm256_add_pd, _mm256_mul_pd, _mm256_setzero_pd};
+	let factor = _mm256_set1_pd(alpha);
+	let zero = _mm256_setzero_pd();
+	let vector_end = m / 4 * 4;
+	for j in 0..n {
+		let rhs = b.add(j * ldb).read();
+		let rhs_vector = _mm256_set1_pd(rhs);
+		let dst = c.add(j * ldc);
+		for i in (0..vector_end).step_by(4) {
+			let value = _mm256_fmadd_pd(_mm256_loadu_pd(a.add(i)), rhs_vector, zero);
+			let scaled = _mm256_mul_pd(factor, value);
+			let out = dst.add(i);
+			_mm256_storeu_pd(out, _mm256_add_pd(scaled, _mm256_loadu_pd(out)));
+		}
+		for i in vector_end..m {
+			let value = a.add(i).read().mul_add(rhs, 0.0);
+			let out = dst.add(i);
+			out.write(alpha * value + out.read());
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn depth_one_suffix_preserves_order_and_padding() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		let (m, n, k) = (9, 7, DEPTH_BLOCK + 1);
+		let (lda, ldb, ldc) = (11, k + 3, 13);
+		let a: Vec<_> = (0..lda * k).map(|i| ((i % 17) as f64 - 8.) / 7.).collect();
+		let b: Vec<_> = (0..ldb * n).map(|i| ((i % 13) as f64 - 6.) / 11.).collect();
+		let alpha = -0.27;
+		let mut left = [0.; 8192];
+		let mut right = [0.; 8192];
+		for beta in [Accum::Replace, Accum::Add] {
+			let mut c = vec![3.; ldc * n];
+			assert!(unsafe {
+				multiply(
+					m,
+					n,
+					k,
+					a.as_ptr(),
+					lda,
+					b.as_ptr(),
+					ldb,
+					c.as_mut_ptr(),
+					ldc,
+					alpha,
+					beta,
+					left.as_mut_ptr(),
+					left.len(),
+					right.as_mut_ptr(),
+					right.len(),
+					4096,
+					32768,
+				)
+			});
+			for j in 0..n {
+				for i in 0..m {
+					let mut dot = 0.;
+					for p in 0..DEPTH_BLOCK {
+						dot = a[i + p * lda].mul_add(b[p + j * ldb], dot);
+					}
+					let first = alpha * dot;
+					let first = if beta == Accum::Add { first + 3. } else { first };
+					let tail = a[i + DEPTH_BLOCK * lda].mul_add(b[DEPTH_BLOCK + j * ldb], 0.);
+					let expected = alpha * tail + first;
+					assert_eq!(c[i + ldc * j].to_bits(), expected.to_bits());
+				}
+				assert!(c[m + ldc * j..ldc * (j + 1)].iter().all(|&v| v == 3.));
+			}
+		}
+	}
 
 	#[test]
 	fn bounded_panels_and_column_tail() {

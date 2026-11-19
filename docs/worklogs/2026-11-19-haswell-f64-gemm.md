@@ -51,3 +51,11 @@ The scalar Rust source in 473ca80 depends on LLVM to choose the vector grouping.
 The revised step loads two vectors of A, broadcasts each B value, and updates the twelve accumulators through Rust AVX2/FMA intrinsics. The machine code from both tested compilers keeps the vector sums in registers. The source retains the existing depth groups, scaling, and final add. Every full-result digest matched the previous draft across the paired measurements.
 
 On Rust 1.99.1, the median across eight fresh paired rounds improved by 73.15% across the four equally weighted orders. The 1024 median fell from 251.035 ms to 66.141 ms. System OpenBLAS took 62.075 ms and Julia's build took 62.694 ms. On Rust 1.96.0, the four-order paired median changed by −0.19%, with four wins in eight comparisons to the earlier draft. In both toolchains the 511 absolute median was lower than both libraries, while 512, 513 and 1024 remained slower.
+
+## Final depth-one group
+
+A 513-deep product ends with a separate one-step arithmetic group. The packed driver now consumes that last A column directly and walks C by column. It keeps FMA with zero, then the separate scaling and add, and uses the same arithmetic for the scalar row tail.
+
+On Haswell with Rust 1.99.1, eight core-load-guarded paired rounds at 513 gave 8.432 ms for 84e0402, 8.345 ms for this candidate, 8.391 ms for system OpenBLAS and 8.455 ms for Julia's OpenBLAS. The candidate won seven rounds against 84e0402 (1.74% median paired improvement), five against system OpenBLAS and six against Julia. Another five-input randomized comparison gave a 3.6% median paired improvement against the draft at 513. A same-process diagnostic that switched just the suffix found a smaller 0.85% improvement.
+
+The other three square orders do not use the suffix. The 1024 time changed by +1.12% by paired median in the guarded rounds and −0.7% in the five-input comparison. The alternate placement in the library dispatch gave a +2.6% paired change at 1024 in that comparison. The 512 and 1024 cases still lack a consistent lead over both OpenBLAS builds. All four square outputs matched 84e0402 bit for bit in all eight guarded rounds. The focused checks exercise padded output and both accumulation modes. [Draft PR #9](https://github.com/tensor4all/t4a-private-gemm-x86/pull/9)
