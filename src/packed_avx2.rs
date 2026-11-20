@@ -1,6 +1,8 @@
 //! Sequential, packed 8 × 6 classical f64 GEMM for contiguous matrix rows.
 use crate::{Accum, DEPTH_BLOCK};
 use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
+#[cfg(test)]
+use core::cell::Cell;
 
 const MR: usize = 8;
 const NR: usize = 6;
@@ -8,9 +10,33 @@ const ADD: usize = 1;
 const RESUME: usize = 2;
 const FINISH: usize = 4;
 
+// Test-only view of the dispatch decision: the gate answer can be forced and
+// the number of times the driver is entered counted. Both are per thread, so
+// parallel tests neither see another test's override nor its calls.
+#[cfg(test)]
+thread_local! {
+	static PROBE: (Cell<i8>, Cell<usize>) = const { (Cell::new(0), Cell::new(0)) };
+}
+
+// 0 leaves the gate alone, 1 accepts every product, -1 rejects every product.
+#[cfg(test)]
+pub(super) fn force_gate(state: i8) {
+	PROBE.with(|(force, _)| force.set(state));
+}
+
+#[cfg(test)]
+pub(super) fn gate_hits() -> usize {
+	PROBE.with(|(_, hits)| hits.get())
+}
+
 // Other AVX2 cores have different load ports and cache geometry. Scope this
 // implementation to the Intel family it was measured on.
 pub(super) fn haswell() -> bool {
+	#[cfg(test)]
+	match PROBE.with(|(force, _)| force.get()) {
+		0 => {},
+		force => return force > 0,
+	}
 	static HASWELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 	*HASWELL.get_or_init(|| {
 		let cpuid = raw_cpuid::CpuId::new();
@@ -145,6 +171,8 @@ pub(super) unsafe fn multiply(
 	l1: usize,
 	l2: usize,
 ) -> bool {
+	#[cfg(test)]
+	PROBE.with(|(_, hits)| hits.set(hits.get() + 1));
 	// Fit one A and one B micro-panel in two thirds of L1. A row block
 	// then occupies up to half of L2. Haswell's 32/256 KiB gives kc=192, mc=80.
 	let kc = (l1 / (MR + NR) * 2 / 3 / 16 * 16).max(16).min(k);
@@ -390,5 +418,119 @@ mod tests {
 		};
 		assert!(used);
 		assert!(c.iter().all(|&value| value == 2. * k as f64));
+	}
+
+	// A full, single-thread, contiguous column-major f64 product: the only
+	// shape the packed driver accepts.
+	#[allow(clippy::too_many_arguments)]
+	fn product(m: usize, n: usize, k: usize, a: &[f64], lda: usize, b: &[f64], ldb: usize, c: &mut [f64], ldc: usize, alpha: f64, beta: Accum) {
+		unsafe {
+			crate::gemm(
+				crate::DType::F64,
+				crate::IType::U64,
+				crate::InstrSet::Avx256,
+				m,
+				n,
+				k,
+				c.as_mut_ptr().cast(),
+				1,
+				ldc as isize,
+				core::ptr::null(),
+				core::ptr::null(),
+				crate::DstKind::Full,
+				beta,
+				a.as_ptr().cast(),
+				1,
+				lda as isize,
+				false,
+				core::ptr::null(),
+				0,
+				b.as_ptr().cast(),
+				1,
+				ldb as isize,
+				false,
+				(&alpha as *const f64).cast(),
+				1,
+			)
+		}
+	}
+
+	fn avx2_fma() -> bool {
+		is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+	}
+
+	// The gate also demands sixteen scalar updates per L2 element, so the
+	// qualifying depth depends on the host's reported L2 size.
+	fn qualifying_depth(m: usize, n: usize) -> usize {
+		let cache = *crate::CACHE_INFO;
+		let l2 = cache[1].cache_bytes / core::mem::size_of::<f64>();
+		(16 * l2).div_ceil(m * n)
+	}
+
+	// The gate is the only way into this driver, so a qualifying product must
+	// reach it and a product below its shape thresholds must not. The answer is
+	// forced, because the host is not always the measured Haswell family.
+	#[test]
+	fn haswell_gate_is_reached_by_a_qualifying_product() {
+		if !avx2_fma() {
+			return;
+		}
+		let (m, n) = (89, 73);
+		let k = qualifying_depth(m, n);
+		let a: Vec<_> = (0..m * k).map(|p| (p % 17) as f64 / 7.).collect();
+		let b: Vec<_> = (0..k * n).map(|p| (p % 13) as f64 / 11.).collect();
+		let mut c = vec![0.; m * n];
+		force_gate(1);
+		let before = gate_hits();
+		product(m, n, k, &a, m, &b, k, &mut c, m, -0.75, Accum::Replace);
+		assert_eq!(gate_hits(), before + 1, "a qualifying product reaches the driver");
+		// m below 32 keeps the same product out of the packed driver.
+		let (m, n) = (16, 8);
+		let a: Vec<_> = (0..m * k).map(|p| (p % 17) as f64 / 7.).collect();
+		let b: Vec<_> = (0..k * n).map(|p| (p % 13) as f64 / 11.).collect();
+		let mut c = vec![0.; m * n];
+		product(m, n, k, &a, m, &b, k, &mut c, m, -0.75, Accum::Replace);
+		assert_eq!(gate_hits(), before + 1, "a product below the gate's row threshold stays out");
+		force_gate(0);
+	}
+
+	// Both drivers group the arithmetic the same way, so the gate decision must
+	// not change one bit of the output.
+	#[test]
+	fn gate_off_matches_gate_on_bit_for_bit() {
+		if !avx2_fma() {
+			return;
+		}
+		let (m, n) = (89, 73);
+		let first = qualifying_depth(m, n);
+		let mut seed = 0x42B5E91u64;
+		let mut sample = || {
+			seed ^= seed << 13;
+			seed ^= seed >> 7;
+			seed ^= seed << 17;
+			(seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+		};
+		for k in [first, first + DEPTH_BLOCK] {
+			let a: Vec<_> = (0..m * k).map(|_| sample()).collect();
+			let b: Vec<_> = (0..k * n).map(|_| sample()).collect();
+			for beta in [Accum::Replace, Accum::Add] {
+				let initial = vec![0.125; m * n];
+				let (mut on, mut off) = (initial.clone(), initial);
+				force_gate(1);
+				let hits = gate_hits();
+				product(m, n, k, &a, m, &b, k, &mut on, m, -0.75, beta);
+				assert_eq!(gate_hits(), hits + 1, "the packed driver ran with the gate on");
+				force_gate(-1);
+				let hits = gate_hits();
+				product(m, n, k, &a, m, &b, k, &mut off, m, -0.75, beta);
+				assert_eq!(gate_hits(), hits, "the general driver ran with the gate off");
+				force_gate(0);
+				for j in 0..n {
+					for i in 0..m {
+						assert_eq!(on[i + j * m].to_bits(), off[i + j * m].to_bits(), "k={k}, i={i}, j={j}, beta={beta:?}");
+					}
+				}
+			}
+		}
 	}
 }
