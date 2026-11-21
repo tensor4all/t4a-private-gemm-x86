@@ -503,6 +503,15 @@ mod tests {
 		}
 		let (m, n) = (89, 73);
 		let first = qualifying_depth(m, n);
+		// The smallest depth the gate accepts, one more full depth block, 513
+		// (one past a depth block) and the smallest accepted depth that ends in
+		// a depth-one tail, so the compared depths keep both shapes whatever L2
+		// the host reports.
+		let tail = first.div_ceil(DEPTH_BLOCK) * DEPTH_BLOCK + 1;
+		let mut depths = vec![first, first + DEPTH_BLOCK, 513, tail];
+		depths.sort_unstable();
+		depths.retain(|&k| k >= first);
+		depths.dedup();
 		let mut seed = 0x42B5E91u64;
 		let mut sample = || {
 			seed ^= seed << 13;
@@ -510,7 +519,7 @@ mod tests {
 			seed ^= seed << 17;
 			(seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
 		};
-		for k in [first, first + DEPTH_BLOCK] {
+		for k in depths {
 			let a: Vec<_> = (0..m * k).map(|_| sample()).collect();
 			let b: Vec<_> = (0..k * n).map(|_| sample()).collect();
 			for beta in [Accum::Replace, Accum::Add] {
@@ -528,6 +537,157 @@ mod tests {
 				for j in 0..n {
 					for i in 0..m {
 						assert_eq!(on[i + j * m].to_bits(), off[i + j * m].to_bits(), "k={k}, i={i}, j={j}, beta={beta:?}");
+					}
+				}
+			}
+		}
+	}
+
+	// The packed driver's own scratch, as the caller allocates it: one row block
+	// of A panels plus the raw accumulator tiles, and one B column panel.
+	#[allow(clippy::too_many_arguments)]
+	fn run_packed(
+		m: usize,
+		n: usize,
+		k: usize,
+		a: &[f64],
+		lda: usize,
+		b: &[f64],
+		ldb: usize,
+		c: &mut [f64],
+		ldc: usize,
+		alpha: f64,
+		beta: Accum,
+	) -> bool {
+		let mut pa = vec![0.; 96 * 1024];
+		let mut pb = vec![0.; 32 * 1024];
+		unsafe {
+			multiply(
+				m,
+				n,
+				k,
+				a.as_ptr(),
+				lda,
+				b.as_ptr(),
+				ldb,
+				c.as_mut_ptr(),
+				ldc,
+				alpha,
+				beta,
+				pa.as_mut_ptr(),
+				pa.len(),
+				pb.as_mut_ptr(),
+				pb.len(),
+				4096,
+				32768,
+			)
+		}
+	}
+
+	// Moved here from `tests/packed_avx2.rs`, where an integration test cannot
+	// reach the force flag and so only tested the general driver on a host that
+	// is not the measured family. These depths are below the dispatch gate's
+	// shape rule, so the driver is called directly and has to report that it ran.
+	#[test]
+	fn forced_packed_driver_preserves_scaled_entries_and_padded_odd_edges() {
+		if !avx2_fma() {
+			return;
+		}
+		let (m, n) = (89usize, 73usize);
+		let (lda, ldc) = (m + 3, m + 7);
+		for k in [191, 192, 193, 385, 513] {
+			let ldb = k + 5;
+			let mut a = vec![f64::NAN; lda * k];
+			let mut b = vec![f64::NAN; ldb * n];
+			for p in 0..k {
+				for i in 0..m {
+					a[i + p * lda] = ((i + 3 * p) % 9) as f64 - 4.;
+					a[i + p * lda] *= 2.0f64.powi(if i % 2 == 0 { -450 } else { 450 });
+				}
+				for j in 0..n {
+					b[p + j * ldb] = ((2 * j + p) % 7) as f64 - 3.;
+					b[p + j * ldb] *= 2.0f64.powi(if j % 2 == 0 { 450 } else { -450 });
+				}
+			}
+			for mode in [Accum::Replace, Accum::Add] {
+				let alpha = -0.75_f64;
+				let mut c = vec![42.; ldc * n];
+				for j in 0..n {
+					for i in 0..m {
+						c[i + j * ldc] = if mode == Accum::Add {
+							2.0f64.powi(match (i % 2, j % 2) {
+								(0, 1) => -900,
+								(1, 0) => 900,
+								_ => 0,
+							})
+						} else {
+							f64::NAN
+						};
+					}
+				}
+				let initial = c.clone();
+				assert!(
+					run_packed(m, n, k, &a, lda, &b, ldb, &mut c, ldc, alpha, mode),
+					"the packed driver ran, k={k}, mode={mode:?}"
+				);
+				for j in 0..n {
+					for i in 0..m {
+						let mut want = initial[i + j * ldc];
+						for start in (0..k).step_by(512) {
+							let sum = (start..k.min(start + 512)).fold(0.0, |v, p| a[i + p * lda].mul_add(b[p + j * ldb], v));
+							let scaled = sum * alpha;
+							if start == 0 && mode == Accum::Replace {
+								want = scaled;
+							} else {
+								want += scaled;
+							}
+						}
+						assert_eq!(c[i + j * ldc], want, "i={i}, j={j}, k={k}, mode={mode:?}");
+					}
+					assert!(c[j * ldc + m..(j + 1) * ldc].iter().all(|x| *x == 42.));
+				}
+			}
+		}
+	}
+
+	// The random-data half of the same move: the original 191..1025 sweep must
+	// equal scalar FMA over the driver's own 512-depth groups.
+	#[test]
+	fn forced_packed_driver_matches_the_scalar_depth_groups_bit_for_bit() {
+		if !avx2_fma() {
+			return;
+		}
+		let (m, n) = (89, 73);
+		let mut seed = 0x42B5E91u64;
+		let mut sample = || {
+			seed ^= seed << 13;
+			seed ^= seed >> 7;
+			seed ^= seed << 17;
+			(seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+		};
+		for k in [191usize, 193, 511, 512, 513, 1025] {
+			let a: Vec<_> = (0..m * k).map(|_| sample()).collect();
+			let b: Vec<_> = (0..k * n).map(|_| sample()).collect();
+			for mode in [Accum::Add, Accum::Replace] {
+				let alpha = -0.75_f64;
+				let mut c = vec![0.125_f64; m * n];
+				assert!(
+					run_packed(m, n, k, &a, m, &b, k, &mut c, m, alpha, mode),
+					"the packed driver ran, k={k}, mode={mode:?}"
+				);
+				for j in 0..n {
+					for i in 0..m {
+						let mut expected = 0.125;
+						for start in (0..k).step_by(512) {
+							let dot = (start..k.min(start + 512)).fold(0.0, |sum, p| a[i + p * m].mul_add(b[p + j * k], sum));
+							let scaled = dot * alpha;
+							if start == 0 && mode == Accum::Replace {
+								expected = scaled;
+							} else {
+								expected += scaled;
+							}
+						}
+						assert_eq!(c[i + j * m].to_bits(), expected.to_bits(), "k={k}, i={i}, j={j}, mode={mode:?}");
 					}
 				}
 			}
