@@ -26,6 +26,12 @@ jobs:
       - name: A warm workspace allocates nothing
         # this binary holds one `#[test]`, so no other test thread allocates while it counts
         run: cargo test --test job_alloc -- --nocapture --test-threads=1
+      - name: Classical f64 packed panels and padded edges
+        # the packed driver's comparisons live in the unit tests: an integration test cannot
+        # force the dispatch gate, so on a non-Haswell runner it would only test the general driver
+        run: |
+          cargo test --lib packed_avx2::tests
+          cargo test --test avx256_f64_depth
       - name: Full suite
         # The crate's own suite is the author's and takes many minutes per shape; it is not
         # what this branch changed, so it runs on demand rather than on every push.
