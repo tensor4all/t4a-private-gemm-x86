@@ -206,6 +206,26 @@ unsafe fn pack_rhs(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: 
 		}
 	}
 }
+// B is `L^T`: its depth index is a row of `L` (stride `ldb`), its column index
+// is the next row (stride 1), the opposite of `pack_rhs`. The trailing
+// Cholesky update needs this because both operands are the same panel.
+#[inline]
+unsafe fn pack_rhs_t(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: usize) {
+	for j in (0..cols).step_by(NR) {
+		let width = (cols - j).min(NR);
+		let src = b.add(j * ldb);
+		let dst = pb.add(j * depth);
+		for p in 0..depth {
+			for t in 0..width {
+				*dst.add(p * NR + t) = *src.add(t + p * ldb);
+			}
+			for t in width..NR {
+				*dst.add(p * NR + t) = 0.;
+			}
+		}
+	}
+}
+
 
 // Cache capacities and scratch lengths are in f64 elements. Row and column
 // panel sizes are rounded down to whole microtiles. Inputs may have padding.
@@ -332,6 +352,105 @@ unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: us
 			out.write(alpha * value + out.read());
 		}
 	}
+}
+
+/// The depth cap of the lower update: one depth panel, the `kc` that `multiply`
+/// derives from an admitted core's 32 KiB L1 (32 KiB of f64 is 4096 elements,
+/// `4096 / (MR + NR) * 2 / 3 / 16 * 16 == 192`, then bounded by `k`). Both the
+/// driver below and the public wrapper in `lib.rs` refuse a deeper call through
+/// this constant, so the two limits cannot drift apart; a change to `multiply`'s
+/// `kc` formula has to change this too.
+pub(super) const SYRK_DEPTH_PANEL: usize = 32768 / 8 / (MR + NR) * 2 / 3 / 16 * 16;
+
+/// f64 elements `pack_lhs` writes for `rows` rows and depth `k`: whole `MR`-row
+/// tiles, so a partial tile still writes `MR` slots per depth.
+#[inline]
+pub(super) const fn lhs_pack_len(rows: usize, k: usize) -> usize {
+	(rows.saturating_add(MR - 1) / MR)
+		.saturating_mul(MR)
+		.saturating_mul(k)
+}
+
+// Lower-triangular rank-k update `C -= L L^T`, the trailing update of a blocked
+// Cholesky factorization: `L` is `n x k` column-major with row stride 1, `C` is
+// `n x n` column-major with row stride 1 and only its lower triangle is read or
+// written. `alpha` scales the product and `beta` adds it to `C` or replaces it.
+//
+// `pa` and `pb` are the caller's scratch: `lhs_pack_len(rows, k)` and `NR * k` f64
+// (the packer writes whole `MR`-row tiles, so a partial tile still writes `MR`
+// slots per depth).
+//
+// One row block `[i0, i0 + rows)` of `C` is one unit of work: it packs that
+// block of `L` once and updates its rows against every column block at or below
+// the diagonal. Blocks are independent (disjoint rows) and each entry's sum over
+// the depth is the same one a single call makes, so a team can hand out blocks
+// and reach the same bits.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn syrk_lower_block(
+	n: usize,
+	k: usize,
+	l: *const f64,
+	lda: usize,
+	c: *mut f64,
+	ldc: usize,
+	alpha: f64,
+	beta: Accum,
+	i0: usize,
+	rows: usize,
+	pa: *mut f64,
+	pb: *mut f64,
+) -> bool {
+	// One depth panel: the Cholesky block updates use k = 16..=192.
+	if k == 0 || k > SYRK_DEPTH_PANEL || lda == 0 || ldc == 0 || rows == 0 || i0 + rows > n {
+		return false;
+	}
+	let flags = if beta == Accum::Add { ADD | FINISH } else { FINISH };
+	pack_lhs(l.add(i0), lda, pa, rows, k);
+	let j_end = Ord::min(n, i0 + rows);
+	for j0 in (0..j_end).step_by(NR) {
+		let cols = (n - j0).min(NR);
+		pack_rhs_t(l.add(j0), lda, pb, cols, k);
+		for i in (0..rows).step_by(MR) {
+			let height = (rows - i).min(MR);
+			let r0 = i0 + i;
+			if r0 + height <= j0 {
+				continue; // every entry is above the diagonal
+			}
+			let ap = pa.add(i * k);
+			if r0 >= j0 + cols && height == MR && cols == NR {
+				tile(
+					ap,
+					pb,
+					c.add(r0 + j0 * ldc),
+					8 * ldc,
+					k,
+					alpha,
+					core::ptr::null_mut(),
+					flags,
+				);
+			} else {
+				let mut edge = [0.; MR * NR];
+				if beta == Accum::Add {
+					for col in 0..cols {
+						for row in 0..height {
+							if r0 + row >= j0 + col {
+								edge[col * MR + row] = *c.add(r0 + row + (j0 + col) * ldc);
+							}
+						}
+					}
+				}
+				tile(ap, pb, edge.as_mut_ptr(), 8 * MR, k, alpha, core::ptr::null_mut(), flags);
+				for col in 0..cols {
+					for row in 0..height {
+						if r0 + row >= j0 + col {
+							*c.add(r0 + row + (j0 + col) * ldc) = edge[col * MR + row];
+						}
+					}
+				}
+			}
+		}
+	}
+	true
 }
 
 #[cfg(test)]
@@ -763,4 +882,275 @@ mod tests {
 			}
 		}
 	}
+	/// Runs one block of the lower update and returns the result next to the
+	/// scalar expectation, using exactly the documented scratch extent with a
+	/// canary past it.
+	fn syrk_block_case(
+		n: usize,
+		k: usize,
+		i0: usize,
+		rows: usize,
+		alpha: f64,
+		beta: Accum,
+	) -> Option<(Vec<f64>, Vec<f64>)> {
+		let lda = n + 3;
+		let ldc = n + 5;
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 17) as f64 - 8.) / 7.).collect();
+		// the strict upper triangle and the rows outside the block carry canaries
+		let mut c = vec![0.; ldc * n];
+		for j in 0..n {
+			for i in 0..n {
+				c[i + j * ldc] = ((i * 5 + j) % 11) as f64 / 3. - 4.;
+			}
+		}
+		let before = c.clone();
+		let (pa_len, pb_len) = (lhs_pack_len(rows, k), NR * k);
+		let mut scratch = vec![0.; pa_len + pb_len + 8];
+		for v in &mut scratch[pa_len + pb_len..] {
+			*v = -1234.5;
+		}
+		let (pa, pb) = scratch.split_at_mut(pa_len);
+		let ran = unsafe {
+			syrk_lower_block(
+				n,
+				k,
+				l.as_ptr(),
+				lda,
+				c.as_mut_ptr(),
+				ldc,
+				alpha,
+				beta,
+				i0,
+				rows,
+				pa.as_mut_ptr(),
+				pb.as_mut_ptr(),
+			)
+		};
+		if !ran {
+			return None;
+		}
+		assert!(
+			scratch[pa_len + pb_len..].iter().all(|&v| v == -1234.5),
+			"the packer stayed inside the documented scratch, n={n}, k={k}, rows={rows}"
+		);
+		// outside the block, and the strict upper triangle, keep their bits
+		for j in 0..n {
+			for i in 0..n {
+				let touched = (i0..i0 + rows).contains(&i) && i >= j;
+				if !touched {
+					assert_eq!(
+						c[i + j * ldc].to_bits(),
+						before[i + j * ldc].to_bits(),
+						"untouched n={n}, k={k}, i0={i0}, rows={rows}, i={i}, j={j}"
+					);
+				}
+			}
+		}
+		let mut want = before.clone();
+		for j in 0..n {
+			for i in (j..n).filter(|i| (i0..i0 + rows).contains(i)) {
+				let mut dot = 0.;
+				for p in 0..k {
+					dot = l[i + p * lda].mul_add(l[j + p * lda], dot);
+				}
+				want[i + j * ldc] = match beta {
+					Accum::Add => before[i + j * ldc] + alpha * dot,
+					Accum::Replace => alpha * dot,
+				};
+			}
+		}
+		Some((c, want))
+	}
+
+	#[test]
+	fn syrk_block_matches_the_scalar_lower_update() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		for (n, k) in [(13usize, 5usize), (96, 64), (97, 192)] {
+			for beta in [Accum::Add, Accum::Replace] {
+				for alpha in [-1.0, 0.75] {
+					// whole range, a block narrower than the microkernels, and blocks
+					// of 1..=7 rows so every partial-tile path is taken
+					let mut blocks = vec![(0usize, n)];
+					blocks.push((n / 3, n - n / 3));
+					for r in [1usize, 3, 5, 7] {
+						if r < n {
+							blocks.push((n - r, r));
+						}
+					}
+					for (i0, rows) in blocks {
+						let (got, want) = syrk_block_case(n, k, i0, rows, alpha, beta)
+							.unwrap_or_else(|| panic!("the driver ran, n={n}, k={k}, rows={rows}"));
+						for j in 0..n {
+							for i in 0..n {
+								let t = got[i + j * ldc_of(n)] - want[i + j * ldc_of(n)];
+								assert!(
+									t.abs() <= 1e-12 * want[i + j * ldc_of(n)].abs().max(1.),
+									"n={n}, k={k}, i0={i0}, rows={rows}, beta={beta:?}: {} vs {}",
+									got[i + j * ldc_of(n)],
+									want[i + j * ldc_of(n)]
+								);
+							}
+						}
+					}
+				}
+			}
+		}
+		// a rejected call must leave the destination bit-unchanged and must not
+		// allocate: one element past the depth panel is outside the driver
+		let n = 32;
+		let k = SYRK_DEPTH_PANEL + 1;
+		let lda = n;
+		let ldc = n;
+		let l: Vec<f64> = (0..lda * k).map(|i| (i % 7) as f64).collect();
+		let mut c = vec![1.5; ldc * n];
+		let before = c.clone();
+		let ran = unsafe {
+			crate::syrk_lower_block(
+				n,
+				k,
+				l.as_ptr(),
+				lda,
+				c.as_mut_ptr(),
+				ldc,
+				-1.0,
+				Accum::Add,
+				0,
+				n,
+			)
+		};
+		assert!(!ran, "k = {k} is outside the driver");
+		assert!(c.iter().zip(&before).all(|(a, b)| a.to_bits() == b.to_bits()));
+	}
+
+	/// The test cases above use `ldc = n + 5`.
+	fn ldc_of(n: usize) -> usize {
+		n + 5
+	}
+
+	// The public entry's success path: whole range in one call against three
+	// blocks, the way a team splits the trailing update. The test-only override
+	// skips only the model admission, so this runs on every AVX2+FMA host and
+	// the entry's scratch sizing, block validation and `Accum` plumbing are
+	// exercised where the production gate does and where it does not.
+	#[test]
+	fn syrk_entry_whole_range_and_partitions_are_bit_identical() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		let _forced_on = ForcedGate::new(1);
+		assert!(haswell());
+		for (n, k) in [(96usize, 64usize), (97, 48)] {
+			let lda = n + 3;
+			let ldc = n + 5;
+			let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+			let base: Vec<f64> = (0..ldc * n)
+				.map(|i| if i % ldc <= (i / ldc) { ((i % 7) as f64) / 3. } else { 9.5 })
+				.collect();
+			let mut whole = base.clone();
+			let mut split = base.clone();
+			assert!(unsafe {
+				crate::syrk_lower_block(n, k, l.as_ptr(), lda, whole.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n)
+			});
+			let step = n / 3;
+			let mut i0 = 0;
+			while i0 < n {
+				let rows = (n - i0).min(step).max(1);
+				assert!(unsafe {
+					crate::syrk_lower_block(
+						n, k, l.as_ptr(), lda, split.as_mut_ptr(), ldc, -1.0, Accum::Add, i0, rows,
+					)
+				}, "block i0={i0}, rows={rows}");
+				i0 += rows;
+			}
+			assert!(
+				whole.iter().zip(&split).all(|(a, b)| a.to_bits() == b.to_bits()),
+				"the row blocks are bit-identical to the whole call, n={n}, k={k}"
+			);
+		}
+	}
+
+	// The scratch is the per-thread buffer, grown once and reused: a repeated
+	// call, and a later smaller one, must not reallocate it.
+	#[test]
+	fn syrk_scratch_is_reused_across_calls() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		let _forced_on = ForcedGate::new(1);
+		let (n, k) = (96usize, 64usize);
+		let (lda, ldc) = (n + 3, n + 5);
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+		let mut c = vec![0.5f64; ldc * n];
+		assert!(unsafe {
+			crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Replace, 0, n)
+		});
+		let first = crate::syrk_scratch_probe();
+		assert!(
+			first.0 >= lhs_pack_len(n, k) + 6 * k,
+			"the scratch holds the packed block plus the RHS panel"
+		);
+		assert!(unsafe {
+			crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n)
+		});
+		assert_eq!(crate::syrk_scratch_probe(), first, "a repeated call must reuse the buffer");
+		// a smaller shape is served from the same allocation
+		assert!(unsafe { crate::syrk_lower_block(n, 16, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n) });
+		assert_eq!(
+			crate::syrk_scratch_probe(),
+			first,
+			"a smaller shape must not reallocate the buffer"
+		);
+	}
+
+	/// Forces the gate for the current thread and restores it on drop.
+	struct ForcedGate;
+	impl ForcedGate {
+		fn new(state: i8) -> Self {
+			force_gate(state);
+			ForcedGate
+		}
+	}
+	impl Drop for ForcedGate {
+		fn drop(&mut self) {
+			force_gate(0);
+		}
+	}
+
+	// The refusal path, covered on every host: with the gate off the entry
+	// returns false and leaves `c` (triangles included) untouched.
+	#[test]
+	fn syrk_entry_refuses_and_writes_nothing_when_the_gate_is_off() {
+		let _off = ForcedGate::new(-1);
+		assert!(!haswell());
+		let (n, k) = (96usize, 64usize);
+		let (lda, ldc) = (n + 3, n + 5);
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+		let base: Vec<f64> = (0..ldc * n).map(|i| (i % 11) as f64 + 0.25).collect();
+		for beta in [Accum::Add, Accum::Replace] {
+			let mut c = base.clone();
+			let ran = unsafe { crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, beta, 0, n) };
+			assert!(!ran, "a gate-excluded host must be refused");
+			assert!(
+				c.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
+				"a refused call must not write c"
+			);
+		}
+	}
+
+	// On a host the real gate excludes (AMD, unlisted Intel), the unforced entry
+	// refuses too; where the gate admits, it runs.
+	#[test]
+	fn syrk_entry_follows_the_production_gate() {
+		let (n, k) = (32usize, 8usize);
+		let l = vec![1.0f64; n * k];
+		let mut c = vec![0.0f64; n * n];
+		let ran = unsafe { crate::syrk_lower_block(n, k, l.as_ptr(), n, c.as_mut_ptr(), n, 1.0, Accum::Replace, 0, n) };
+		assert_eq!(ran, haswell());
+		if !ran {
+			assert!(c.iter().all(|&v| v == 0.0));
+		}
+	}
+
 }
