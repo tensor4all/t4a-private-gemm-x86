@@ -1275,6 +1275,70 @@ impl<'a> MilliScratch<'a> {
 ///
 /// The same as [`gemm_with`].
 #[allow(clippy::too_many_arguments)]
+/// Lower-triangular rank-`k` update `C += alpha * L L^T` for one row block of
+/// `C`, the trailing update of a blocked Cholesky factorization, through the
+/// packed 8x6 AVX2 kernel.
+///
+/// * `l` is `n x k`, column-major, row stride 1.
+/// * `c` is `n x n`, column-major, row stride 1; only rows `[i0, i0 + rows)`
+///   and the entries at or below the diagonal are read or written.
+/// * `beta` is [`Accum::Add`] to add into `C` (which must be initialized for the
+///   block) or [`Accum::Replace`] to overwrite the block.
+///
+/// The blocks are independent, and each entry's sum over the depth is the same
+/// one a whole-range call makes, so a caller may hand different rows to
+/// different threads and reach bit-identical results.
+///
+/// Returns `false` without touching anything when this CPU or shape is outside
+/// the packed driver (a CPU the GEMM gate does not admit, `k == 0`, `k > 192`, a
+/// zero stride, or a block outside `C`); the caller keeps its own product in
+/// that case. The scratch is per thread, grows to `rows * k + 6 * k` `f64` and
+/// is reused, so a steady-state call allocates nothing.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn syrk_lower_block(
+	n: usize,
+	k: usize,
+	l: *const f64,
+	lda: usize,
+	c: *mut f64,
+	ldc: usize,
+	alpha: f64,
+	beta: Accum,
+	i0: usize,
+	rows: usize,
+) -> bool {
+	if !packed_avx2::haswell() || rows == 0 || k == 0 {
+		return false;
+	}
+	let pa_len = rows * k;
+	let pb_len = 6 * k;
+	thread_local! {
+		static SYRK_MEM: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+	}
+	SYRK_MEM.with(|mem| {
+		let mut mem = mem.borrow_mut();
+		if mem.len() < pa_len + pb_len {
+			mem.resize(pa_len + pb_len, 0.);
+		}
+		let (pa, pb) = mem.split_at_mut(pa_len);
+		packed_avx2::syrk_lower_block(
+			n,
+			k,
+			l,
+			lda,
+			c,
+			ldc,
+			alpha,
+			beta,
+			i0,
+			rows,
+			pa.as_mut_ptr(),
+			pb.as_mut_ptr(),
+		)
+	})
+}
+
 pub unsafe fn gemm_with_scratch(
 	dtype: DType,
 	itype: IType,

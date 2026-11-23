@@ -206,6 +206,26 @@ unsafe fn pack_rhs(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: 
 		}
 	}
 }
+// B is `L^T`: its depth index is a row of `L` (stride `ldb`), its column index
+// is the next row (stride 1), the opposite of `pack_rhs`. The trailing
+// Cholesky update needs this because both operands are the same panel.
+#[inline]
+unsafe fn pack_rhs_t(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: usize) {
+	for j in (0..cols).step_by(NR) {
+		let width = (cols - j).min(NR);
+		let src = b.add(j * ldb);
+		let dst = pb.add(j * depth);
+		for p in 0..depth {
+			for t in 0..width {
+				*dst.add(p * NR + t) = *src.add(t + p * ldb);
+			}
+			for t in width..NR {
+				*dst.add(p * NR + t) = 0.;
+			}
+		}
+	}
+}
+
 
 // Cache capacities and scratch lengths are in f64 elements. Row and column
 // panel sizes are rounded down to whole microtiles. Inputs may have padding.
@@ -332,6 +352,86 @@ unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: us
 			out.write(alpha * value + out.read());
 		}
 	}
+}
+
+// Lower-triangular rank-k update `C -= L L^T`, the trailing update of a blocked
+// Cholesky factorization: `L` is `n x k` column-major with row stride 1, `C` is
+// `n x n` column-major with row stride 1 and only its lower triangle is read or
+// written. `alpha` scales the product and `beta` adds it to `C` or replaces it.
+//
+// `pa` and `pb` are the caller's scratch: `rows * k` and `NR * k` f64.
+//
+// One row block `[i0, i0 + rows)` of `C` is one unit of work: it packs that
+// block of `L` once and updates its rows against every column block at or below
+// the diagonal. Blocks are independent (disjoint rows) and each entry's sum over
+// the depth is the same one a single call makes, so a team can hand out blocks
+// and reach the same bits.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn syrk_lower_block(
+	n: usize,
+	k: usize,
+	l: *const f64,
+	lda: usize,
+	c: *mut f64,
+	ldc: usize,
+	alpha: f64,
+	beta: Accum,
+	i0: usize,
+	rows: usize,
+	pa: *mut f64,
+	pb: *mut f64,
+) -> bool {
+	// One depth panel: the Cholesky block updates use k = 16..=192.
+	if k == 0 || k > 192 || lda == 0 || ldc == 0 || rows == 0 || i0 + rows > n {
+		return false;
+	}
+	let flags = if beta == Accum::Add { ADD | FINISH } else { FINISH };
+	pack_lhs(l.add(i0), lda, pa, rows, k);
+	let j_end = Ord::min(n, i0 + rows);
+	for j0 in (0..j_end).step_by(NR) {
+		let cols = (n - j0).min(NR);
+		pack_rhs_t(l.add(j0), lda, pb, cols, k);
+		for i in (0..rows).step_by(MR) {
+			let height = (rows - i).min(MR);
+			let r0 = i0 + i;
+			if r0 + height <= j0 {
+				continue; // every entry is above the diagonal
+			}
+			let ap = pa.add(i * k);
+			if r0 >= j0 + cols && height == MR && cols == NR {
+				tile(
+					ap,
+					pb,
+					c.add(r0 + j0 * ldc),
+					8 * ldc,
+					k,
+					alpha,
+					core::ptr::null_mut(),
+					flags,
+				);
+			} else {
+				let mut edge = [0.; MR * NR];
+				if beta == Accum::Add {
+					for col in 0..cols {
+						for row in 0..height {
+							if r0 + row >= j0 + col {
+								edge[col * MR + row] = *c.add(r0 + row + (j0 + col) * ldc);
+							}
+						}
+					}
+				}
+				tile(ap, pb, edge.as_mut_ptr(), 8 * MR, k, alpha, core::ptr::null_mut(), flags);
+				for col in 0..cols {
+					for row in 0..height {
+						if r0 + row >= j0 + col {
+							*c.add(r0 + row + (j0 + col) * ldc) = edge[col * MR + row];
+						}
+					}
+				}
+			}
+		}
+	}
+	true
 }
 
 #[cfg(test)]
@@ -763,4 +863,71 @@ mod tests {
 			}
 		}
 	}
+	#[test]
+	fn syrk_block_matches_the_scalar_lower_update() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		// (n, k): both tiles below an 8x6 microtile, a single block, and a block
+		// narrower than the microkernels with the rest of the rows left to another
+		// caller.
+		for (n, k, i0, rows) in [(13usize, 5usize, 0usize, 13usize), (96, 64, 0, 96), (96, 64, 32, 19), (97, 193, 0, 97)] {
+			let lda = n + 3;
+			let ldc = n + 5;
+			let l: Vec<_> = (0..lda * k).map(|i| ((i % 17) as f64 - 8.) / 7.).collect();
+			let mut c = vec![0.; ldc * n];
+			for j in 0..n {
+				for i in j..n {
+					c[i + j * ldc] = ((i * 5 + j) % 11) as f64 / 3.;
+				}
+			}
+			let before = c.clone();
+			let alpha = -1.0;
+			let mut pa = vec![0.; 1024 * 192];
+			let mut pb = vec![0.; 6 * 192];
+			let ran = unsafe {
+				syrk_lower_block(
+					n,
+					k,
+					l.as_ptr(),
+					lda,
+					c.as_mut_ptr(),
+					ldc,
+					alpha,
+					Accum::Add,
+					i0,
+					rows,
+					pa.as_mut_ptr(),
+					pb.as_mut_ptr(),
+				)
+			};
+			assert_eq!(ran, k <= 192, "the driver takes k <= 192, n={n}, k={k}");
+			if !ran {
+				continue;
+			}
+			for j in 0..n {
+				for i in j..n {
+					let touched = (i0..i0 + rows).contains(&i) && i + 1 > j;
+					if !touched {
+						assert_eq!(c[i + j * ldc].to_bits(), before[i + j * ldc].to_bits(), "untouched n={n}, k={k}, i={i}, j={j}");
+					}
+				}
+			}
+			for j in 0..n {
+				for i in (j..n).filter(|i| (i0..i0 + rows).contains(i)) {
+					let mut dot = 0.;
+					for p in 0..k {
+						dot = l[i + p * lda].mul_add(l[j + p * lda], dot);
+					}
+					let expected = before[i + j * ldc] + alpha * dot;
+					assert!(
+						(c[i + j * ldc] - expected).abs() <= 1e-12 * expected.abs().max(1.),
+						"n={n}, k={k}, i={i}, j={j}: {} vs {expected}",
+						c[i + j * ldc]
+					);
+				}
+			}
+		}
+	}
+
 }
