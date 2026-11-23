@@ -1266,24 +1266,15 @@ impl<'a> MilliScratch<'a> {
 	}
 }
 
-/// Like [`gemm_with`], but the parallel job tables come from `scratch` instead of being
-/// allocated per call. Size the workspace with [`MilliScratch::required`]: a call whose scratch
-/// is at least that long, and whose packing storage the kernel has already grown, allocates
-/// nothing (a shorter scratch or a first, larger product falls back to allocating).
-///
-/// # Safety
-///
-/// The same as [`gemm_with`].
-#[allow(clippy::too_many_arguments)]
 /// Lower-triangular rank-`k` update `C += alpha * L L^T` for one row block of
 /// `C`, the trailing update of a blocked Cholesky factorization, through the
 /// packed 8x6 AVX2 kernel.
 ///
 /// * `l` is `n x k`, column-major, row stride 1.
-/// * `c` is `n x n`, column-major, row stride 1; only rows `[i0, i0 + rows)`
-///   and the entries at or below the diagonal are read or written.
-/// * `beta` is [`Accum::Add`] to add into `C` (which must be initialized for the
-///   block) or [`Accum::Replace`] to overwrite the block.
+/// * `c` is `n x n`, column-major, row stride 1; only rows `[i0, i0 + rows)` and
+///   the entries at or below the diagonal are read or written.
+/// * `beta` is [`Accum::Add`] to add into `C` (whose block must be initialized)
+///   or [`Accum::Replace`] to overwrite it.
 ///
 /// The blocks are independent, and each entry's sum over the depth is the same
 /// one a whole-range call makes, so a caller may hand different rows to
@@ -1292,8 +1283,21 @@ impl<'a> MilliScratch<'a> {
 /// Returns `false` without touching anything when this CPU or shape is outside
 /// the packed driver (a CPU the GEMM gate does not admit, `k == 0`, `k > 192`, a
 /// zero stride, or a block outside `C`); the caller keeps its own product in
-/// that case. The scratch is per thread, grows to `rows * k + 6 * k` `f64` and
-/// is reused, so a steady-state call allocates nothing.
+/// that case. The scratch is per thread, [`packed_avx2::lhs_pack_len`]`(rows, k)
+/// + 6 * k` `f64` (the packer writes whole 8-row tiles), grown on demand and
+/// reused, so a steady-state call allocates nothing.
+///
+/// # Safety
+///
+/// * `l` must be valid for reads of `n x k` column-major `f64` with row stride 1
+///   and leading dimension `lda`: `l.add((n - 1) + (k - 1) * lda)` must be in
+///   bounds when `n, k > 0`.
+/// * `c` must be valid for writes, and for reads when `beta` is [`Accum::Add`],
+///   of `n x n` column-major `f64` with row stride 1 and leading dimension `ldc`.
+/// * The `l` and `c` regions must not overlap, and the caller must have
+///   exclusive access to the rows `[i0, i0 + rows)` of `c` for the duration of
+///   the call. Sharing `c` between threads is sound only when each thread holds
+///   a different row block; `l` may be shared between them.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn syrk_lower_block(
@@ -1308,18 +1312,34 @@ pub unsafe fn syrk_lower_block(
 	i0: usize,
 	rows: usize,
 ) -> bool {
-	if !packed_avx2::haswell() || rows == 0 || k == 0 {
+	// Reject every unsupported shape before touching the workspace: a rejected
+	// call must not overflow the size arithmetic or grow a buffer.
+	if !packed_avx2::haswell()
+		|| k == 0
+		|| k > 192
+		|| lda == 0
+		|| ldc == 0
+		|| rows == 0
+		|| i0 > n
+		|| rows > n - i0
+	{
 		return false;
 	}
-	let pa_len = rows * k;
-	let pb_len = 6 * k;
+	let pa_len = packed_avx2::lhs_pack_len(rows, k);
+	// `k <= 192` above, so only the product can overflow.
+	let Some(total) = pa_len.checked_add(6 * k) else {
+		return false;
+	};
+	if total == usize::MAX {
+		return false;
+	}
 	thread_local! {
 		static SYRK_MEM: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 	}
 	SYRK_MEM.with(|mem| {
 		let mut mem = mem.borrow_mut();
-		if mem.len() < pa_len + pb_len {
-			mem.resize(pa_len + pb_len, 0.);
+		if mem.len() < total {
+			mem.resize(total, 0.);
 		}
 		let (pa, pb) = mem.split_at_mut(pa_len);
 		packed_avx2::syrk_lower_block(
@@ -1339,6 +1359,15 @@ pub unsafe fn syrk_lower_block(
 	})
 }
 
+/// Like [`gemm_with`], but the parallel job tables come from `scratch` instead of being
+/// allocated per call. Size the workspace with [`MilliScratch::required`]: a call whose scratch
+/// is at least that long, and whose packing storage the kernel has already grown, allocates
+/// nothing (a shorter scratch or a first, larger product falls back to allocating).
+///
+/// # Safety
+///
+/// The same as [`gemm_with`].
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_with_scratch(
 	dtype: DType,
 	itype: IType,

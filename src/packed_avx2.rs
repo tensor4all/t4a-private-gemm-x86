@@ -354,12 +354,23 @@ unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: us
 	}
 }
 
+/// f64 elements `pack_lhs` writes for `rows` rows and depth `k`: whole `MR`-row
+/// tiles, so a partial tile still writes `MR` slots per depth.
+#[inline]
+pub(super) const fn lhs_pack_len(rows: usize, k: usize) -> usize {
+	(rows.saturating_add(MR - 1) / MR)
+		.saturating_mul(MR)
+		.saturating_mul(k)
+}
+
 // Lower-triangular rank-k update `C -= L L^T`, the trailing update of a blocked
 // Cholesky factorization: `L` is `n x k` column-major with row stride 1, `C` is
 // `n x n` column-major with row stride 1 and only its lower triangle is read or
 // written. `alpha` scales the product and `beta` adds it to `C` or replaces it.
 //
-// `pa` and `pb` are the caller's scratch: `rows * k` and `NR * k` f64.
+// `pa` and `pb` are the caller's scratch: `lhs_pack_len(rows, k)` and `NR * k` f64
+// (the packer writes whole `MR`-row tiles, so a partial tile still writes `MR`
+// slots per depth).
 //
 // One row block `[i0, i0 + rows)` of `C` is one unit of work: it packs that
 // block of `L` once and updates its rows against every column block at or below
@@ -863,70 +874,187 @@ mod tests {
 			}
 		}
 	}
+	/// Runs one block of the lower update and returns the result next to the
+	/// scalar expectation, using exactly the documented scratch extent with a
+	/// canary past it.
+	fn syrk_block_case(
+		n: usize,
+		k: usize,
+		i0: usize,
+		rows: usize,
+		alpha: f64,
+		beta: Accum,
+	) -> Option<(Vec<f64>, Vec<f64>)> {
+		let lda = n + 3;
+		let ldc = n + 5;
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 17) as f64 - 8.) / 7.).collect();
+		// the strict upper triangle and the rows outside the block carry canaries
+		let mut c = vec![0.; ldc * n];
+		for j in 0..n {
+			for i in 0..n {
+				c[i + j * ldc] = ((i * 5 + j) % 11) as f64 / 3. - 4.;
+			}
+		}
+		let before = c.clone();
+		let (pa_len, pb_len) = (lhs_pack_len(rows, k), NR * k);
+		let mut scratch = vec![0.; pa_len + pb_len + 8];
+		for v in &mut scratch[pa_len + pb_len..] {
+			*v = -1234.5;
+		}
+		let (pa, pb) = scratch.split_at_mut(pa_len);
+		let ran = unsafe {
+			syrk_lower_block(
+				n,
+				k,
+				l.as_ptr(),
+				lda,
+				c.as_mut_ptr(),
+				ldc,
+				alpha,
+				beta,
+				i0,
+				rows,
+				pa.as_mut_ptr(),
+				pb.as_mut_ptr(),
+			)
+		};
+		if !ran {
+			return None;
+		}
+		assert!(
+			scratch[pa_len + pb_len..].iter().all(|&v| v == -1234.5),
+			"the packer stayed inside the documented scratch, n={n}, k={k}, rows={rows}"
+		);
+		// outside the block, and the strict upper triangle, keep their bits
+		for j in 0..n {
+			for i in 0..n {
+				let touched = (i0..i0 + rows).contains(&i) && i >= j;
+				if !touched {
+					assert_eq!(
+						c[i + j * ldc].to_bits(),
+						before[i + j * ldc].to_bits(),
+						"untouched n={n}, k={k}, i0={i0}, rows={rows}, i={i}, j={j}"
+					);
+				}
+			}
+		}
+		let mut want = before.clone();
+		for j in 0..n {
+			for i in (j..n).filter(|i| (i0..i0 + rows).contains(i)) {
+				let mut dot = 0.;
+				for p in 0..k {
+					dot = l[i + p * lda].mul_add(l[j + p * lda], dot);
+				}
+				want[i + j * ldc] = match beta {
+					Accum::Add => before[i + j * ldc] + alpha * dot,
+					Accum::Replace => alpha * dot,
+				};
+			}
+		}
+		Some((c, want))
+	}
+
 	#[test]
 	fn syrk_block_matches_the_scalar_lower_update() {
 		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 			return;
 		}
-		// (n, k): both tiles below an 8x6 microtile, a single block, and a block
-		// narrower than the microkernels with the rest of the rows left to another
-		// caller.
-		for (n, k, i0, rows) in [(13usize, 5usize, 0usize, 13usize), (96, 64, 0, 96), (96, 64, 32, 19), (97, 193, 0, 97)] {
+		for (n, k) in [(13usize, 5usize), (96, 64), (97, 192)] {
+			for beta in [Accum::Add, Accum::Replace] {
+				for alpha in [-1.0, 0.75] {
+					// whole range, a block narrower than the microkernels, and blocks
+					// of 1..=7 rows so every partial-tile path is taken
+					let mut blocks = vec![(0usize, n)];
+					blocks.push((n / 3, n - n / 3));
+					for r in [1usize, 3, 5, 7] {
+						if r < n {
+							blocks.push((n - r, r));
+						}
+					}
+					for (i0, rows) in blocks {
+						let (got, want) = syrk_block_case(n, k, i0, rows, alpha, beta)
+							.unwrap_or_else(|| panic!("the driver ran, n={n}, k={k}, rows={rows}"));
+						for j in 0..n {
+							for i in 0..n {
+								let t = got[i + j * ldc_of(n)] - want[i + j * ldc_of(n)];
+								assert!(
+									t.abs() <= 1e-12 * want[i + j * ldc_of(n)].abs().max(1.),
+									"n={n}, k={k}, i0={i0}, rows={rows}, beta={beta:?}: {} vs {}",
+									got[i + j * ldc_of(n)],
+									want[i + j * ldc_of(n)]
+								);
+							}
+						}
+					}
+				}
+			}
+		}
+		// a rejected call must leave the destination bit-unchanged and must not
+		// allocate: `k > 192` is outside the driver
+		let n = 32;
+		let k = 193;
+		let lda = n;
+		let ldc = n;
+		let l: Vec<f64> = (0..lda * k).map(|i| (i % 7) as f64).collect();
+		let mut c = vec![1.5; ldc * n];
+		let before = c.clone();
+		let ran = unsafe {
+			crate::syrk_lower_block(
+				n,
+				k,
+				l.as_ptr(),
+				lda,
+				c.as_mut_ptr(),
+				ldc,
+				-1.0,
+				Accum::Add,
+				0,
+				n,
+			)
+		};
+		assert!(!ran, "k = 193 is outside the driver");
+		assert!(c.iter().zip(&before).all(|(a, b)| a.to_bits() == b.to_bits()));
+	}
+
+	/// The test cases above use `ldc = n + 5`.
+	fn ldc_of(n: usize) -> usize {
+		n + 5
+	}
+
+	#[test]
+	fn syrk_whole_range_and_partitions_are_bit_identical() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		// the public entry: whole range in one call against three blocks, the way
+		// a team splits the trailing update
+		for (n, k) in [(96usize, 64usize), (97, 48)] {
 			let lda = n + 3;
 			let ldc = n + 5;
-			let l: Vec<_> = (0..lda * k).map(|i| ((i % 17) as f64 - 8.) / 7.).collect();
-			let mut c = vec![0.; ldc * n];
-			for j in 0..n {
-				for i in j..n {
-					c[i + j * ldc] = ((i * 5 + j) % 11) as f64 / 3.;
-				}
+			let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+			let base: Vec<f64> = (0..ldc * n)
+				.map(|i| if i % ldc <= (i / ldc) { ((i % 7) as f64) / 3. } else { 9.5 })
+				.collect();
+			let mut whole = base.clone();
+			let mut split = base.clone();
+			assert!(unsafe {
+				crate::syrk_lower_block(n, k, l.as_ptr(), lda, whole.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n)
+			});
+			let step = n / 3;
+			let mut i0 = 0;
+			while i0 < n {
+				let rows = (n - i0).min(step).max(1);
+				assert!(unsafe {
+					crate::syrk_lower_block(
+						n, k, l.as_ptr(), lda, split.as_mut_ptr(), ldc, -1.0, Accum::Add, i0, rows,
+					)
+				}, "block i0={i0}, rows={rows}");
+				i0 += rows;
 			}
-			let before = c.clone();
-			let alpha = -1.0;
-			let mut pa = vec![0.; 1024 * 192];
-			let mut pb = vec![0.; 6 * 192];
-			let ran = unsafe {
-				syrk_lower_block(
-					n,
-					k,
-					l.as_ptr(),
-					lda,
-					c.as_mut_ptr(),
-					ldc,
-					alpha,
-					Accum::Add,
-					i0,
-					rows,
-					pa.as_mut_ptr(),
-					pb.as_mut_ptr(),
-				)
-			};
-			assert_eq!(ran, k <= 192, "the driver takes k <= 192, n={n}, k={k}");
-			if !ran {
-				continue;
-			}
-			for j in 0..n {
-				for i in j..n {
-					let touched = (i0..i0 + rows).contains(&i) && i + 1 > j;
-					if !touched {
-						assert_eq!(c[i + j * ldc].to_bits(), before[i + j * ldc].to_bits(), "untouched n={n}, k={k}, i={i}, j={j}");
-					}
-				}
-			}
-			for j in 0..n {
-				for i in (j..n).filter(|i| (i0..i0 + rows).contains(i)) {
-					let mut dot = 0.;
-					for p in 0..k {
-						dot = l[i + p * lda].mul_add(l[j + p * lda], dot);
-					}
-					let expected = before[i + j * ldc] + alpha * dot;
-					assert!(
-						(c[i + j * ldc] - expected).abs() <= 1e-12 * expected.abs().max(1.),
-						"n={n}, k={k}, i={i}, j={j}: {} vs {expected}",
-						c[i + j * ldc]
-					);
-				}
-			}
+			assert!(
+				whole.iter().zip(&split).all(|(a, b)| a.to_bits() == b.to_bits()),
+				"the row blocks are bit-identical to the whole call, n={n}, k={k}"
+			);
 		}
 	}
 
