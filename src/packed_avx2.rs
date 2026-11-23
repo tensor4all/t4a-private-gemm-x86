@@ -1021,6 +1021,7 @@ mod tests {
 		n + 5
 	}
 
+	// Runs wherever the production gate really admits the host.
 	#[test]
 	fn syrk_whole_range_and_partitions_are_bit_identical() {
 		// The public entry refuses unless the production gate admits this host
@@ -1028,6 +1029,24 @@ mod tests {
 		if !haswell() {
 			return;
 		}
+		syrk_partition_case();
+	}
+
+	// The same success path on any AVX2+FMA host: the test-only override skips
+	// only the model admission, so the entry's scratch sizing, validation and
+	// `Accum` plumbing are exercised on hosts the production gate excludes.
+	#[test]
+	fn syrk_entry_success_path_runs_with_the_gate_forced_on() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
+		}
+		force_gate(1);
+		let _restore = GateOff::restore();
+		assert!(haswell());
+		syrk_partition_case();
+	}
+
+	fn syrk_partition_case() {
 		// the public entry: whole range in one call against three blocks, the way
 		// a team splits the trailing update
 		for (n, k) in [(96usize, 64usize), (97, 48)] {
@@ -1065,6 +1084,11 @@ mod tests {
 	impl GateOff {
 		fn new() -> Self {
 			force_gate(-1);
+			GateOff
+		}
+
+		/// Restores the real gate on drop without changing it now.
+		fn restore() -> Self {
 			GateOff
 		}
 	}

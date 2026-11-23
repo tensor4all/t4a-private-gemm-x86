@@ -1298,7 +1298,7 @@ impl<'a> MilliScratch<'a> {
 ///   exclusive access to the rows `[i0, i0 + rows)` of `c` for the duration of
 ///   the call. Sharing `c` between threads is sound only when each thread holds
 ///   a different row block; `l` may be shared between them.
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn syrk_lower_block(
 	n: usize,
@@ -1330,9 +1330,6 @@ pub unsafe fn syrk_lower_block(
 	let Some(total) = pa_len.checked_add(6 * k) else {
 		return false;
 	};
-	if total == usize::MAX {
-		return false;
-	}
 	thread_local! {
 		static SYRK_MEM: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 	}
