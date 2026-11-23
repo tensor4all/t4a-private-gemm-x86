@@ -3,6 +3,11 @@
 
 const M: usize = 4;
 const N: usize = 32;
+
+#[cfg(test)]
+fn has_avx512() -> bool {
+	std::arch::is_x86_feature_detected!("avx512f")
+}
 // Depth at which the classical kernel scales and commits each partial product.
 const DEPTH_BLOCK: usize = 512;
 
@@ -2023,6 +2028,10 @@ mod tests_f64 {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<f64>() as isize;
@@ -2114,6 +2123,9 @@ mod tests_f64 {
 		let len = 64 / size_of::<f64>();
 
 		for instr in [InstrSet::Avx256, InstrSet::Avx512] {
+			if matches!(instr, InstrSet::Avx512) && !crate::has_avx512() {
+				continue;
+			}
 			for pack_lhs in [false, true] {
 				for pack_rhs in [false] {
 					for alpha in [1.0.into(), 0.0.into(), 2.5.into()] {
@@ -2192,6 +2204,10 @@ mod tests_f64 {
 	}
 	#[test]
 	fn test_avx512_kernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let m = 1023usize;
 		let n = 1023usize;
 		let k = 5usize;
@@ -2312,6 +2328,10 @@ mod tests_c64 {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c64>() as isize;
@@ -2429,6 +2449,10 @@ mod tests_f32 {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<f32>() as isize;
@@ -2514,6 +2538,10 @@ mod tests_f32 {
 
 	#[test]
 	fn test_avx512_kernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let m = 6000usize;
 		let n = 2000usize;
 		let k = 5usize;
@@ -2635,6 +2663,10 @@ mod tests_c32 {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
@@ -2767,6 +2799,10 @@ mod tests_c32_lower {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
@@ -3026,6 +3062,10 @@ mod tests_c32_lower_add {
 
 	#[test]
 	fn test_avx512_microkernel_rowmajor() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c64>() as isize;
@@ -3139,6 +3179,10 @@ mod tests_c32_lower_add {
 
 	#[test]
 	fn test_avx512_microkernel_colmajor() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c64>() as isize;
@@ -3261,6 +3305,10 @@ mod tests_c32_upper {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
@@ -3392,6 +3440,10 @@ mod transpose_tests {
 
 	#[test]
 	fn test_b128() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		for m in 1..=24 {
@@ -3443,6 +3495,10 @@ mod transpose_tests {
 
 	#[test]
 	fn test_b64() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		for m in 1..=48 {
@@ -3494,6 +3550,10 @@ mod transpose_tests {
 
 	#[test]
 	fn test_b32() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		for m in 1..=96 {
@@ -3556,6 +3616,10 @@ mod tests_c32_gather_scatter {
 
 	#[test]
 	fn test_avx512_microkernel() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
@@ -3683,6 +3747,10 @@ mod tests_c32_gather_scatter {
 
 	#[test]
 	fn test_avx512_microkernel2() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
@@ -3811,6 +3879,10 @@ mod tests_c32_gather_scatter {
 
 	#[test]
 	fn test_avx512_microkernel3() {
+		if !crate::has_avx512() {
+			eprintln!("skipping: AVX-512 is not available");
+			return;
+		}
 		let rng = &mut StdRng::seed_from_u64(0);
 
 		let sizeof = size_of::<c32>() as isize;
