@@ -278,7 +278,23 @@ fn cache_info() -> Option<[CacheInfo; 3]> {
 						all_info[1].cache_bytes = l2 / cpusperl2;
 					}
 				}
-				all_info[2].cache_bytes = 0;
+				// Intel Macs expose hw.l3cachesize; Apple Silicon exposes the
+				// performance-level L3. Without this the 2 MiB default capped
+				// the packed driver's column band on a 16 MiB L3 and forced the
+				// A panel to be re-packed for every column band.
+				if let Ok(l3) = Ctl::new("hw.l3cachesize").and_then(|ctl| ctl.value_string()) {
+					if let Ok(l3) = l3.parse::<usize>() {
+						all_info[2].cache_bytes = l3;
+					}
+				}
+				if all_info[2].cache_bytes == 0 {
+					if let Ok(l3) = Ctl::new("hw.perflevel0.l3cachesize").and_then(|ctl| ctl.value_string()) {
+						if let Ok(l3) = l3.parse::<usize>() {
+							all_info[2].cache_bytes = l3;
+						}
+					}
+				}
+				all_info[2].cache_bytes = Ord::max(all_info[2].cache_bytes, all_info[1].cache_bytes * 4);
 				return Some(all_info);
 			}
 		}
