@@ -1,6 +1,6 @@
 //! Sequential, packed 8 × 6 classical f64 GEMM for contiguous matrix rows.
 use crate::{Accum, DEPTH_BLOCK};
-use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
+use core::arch::x86_64::{_mm256_mul_pd, _mm256_add_pd, _mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
 #[cfg(test)]
 use core::cell::Cell;
 
@@ -31,20 +31,67 @@ pub(super) fn gate_hits() -> usize {
 
 // Other AVX2 cores have different load ports and cache geometry. Scope this
 // implementation to the Intel family it was measured on.
+//
+// The measured host is Haswell (0x3C/0x3F/0x45/0x46; 0x45/0x46 are
+// Haswell-ULT/GT3e). Skylake through Coffee Lake client (0x4E, 0x5E, 0x8E,
+// 0x9E) keep the same 2-load-port, 32 KiB L1 / 256 KiB L2 core this tile is
+// derived for, so they are admitted as the same family and measured separately
+// (the Skylake-generation desktop in gemm-skylake-lab). AVX-512 hosts never
+// reach this gate: the caller chooses `InstrSet` and this gate requires
+// `Avx256`; none of the admitted model IDs has AVX-512.
 pub(super) fn haswell() -> bool {
 	#[cfg(test)]
 	match PROBE.with(|(force, _)| force.get()) {
 		0 => {},
 		force => return force > 0,
 	}
-	static HASWELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*HASWELL.get_or_init(|| {
-		let cpuid = raw_cpuid::CpuId::new();
-		cpuid.get_vendor_info().is_some_and(|v| v.as_str() == "GenuineIntel")
-			&& cpuid
-				.get_feature_info()
-				.is_some_and(|f| f.family_id() == 6 && matches!(f.model_id(), 0x3C | 0x3F | 0x45 | 0x46))
+	cpu_admitted()
+}
+
+/// The `GenuineIntel` model ID, or `None` when this is not an Intel family-6
+/// part.
+fn cpu_model() -> Option<u8> {
+	let cpuid = raw_cpuid::CpuId::new();
+	cpuid.get_vendor_info()?.as_str().eq("GenuineIntel").then_some(())?;
+	let feature = cpuid.get_feature_info()?;
+	(feature.family_id() == 6).then(|| feature.model_id())
+}
+
+/// The shared CPU admission: the Haswell-style core and the instruction set the
+/// packed driver compiles with.
+pub(super) fn cpu_admitted() -> bool {
+	static ADMITTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ADMITTED.get_or_init(|| {
+		if !std::arch::is_x86_feature_detected!("avx2") || !std::arch::is_x86_feature_detected!("fma") {
+			return false;
+		}
+		cpu_model().is_some_and(admitted_model)
 	})
+}
+
+/// The work floor in units of L2 elements. Haswell keeps the floor measured in
+/// #9; the Skylake client family was measured at 128 on the i9-9900K.
+pub(super) fn floor_factor() -> usize {
+	static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+	*FLOOR.get_or_init(|| {
+		if cpu_model().is_some_and(|m| matches!(m, 0x4E | 0x5E | 0x8E | 0x9E)) {
+			128
+		} else {
+			16
+		}
+	})
+}
+
+/// Intel model IDs with the Haswell-style core this tile was derived for.
+#[inline]
+pub(super) fn admitted_model(model: u8) -> bool {
+	matches!(
+		model,
+		// Haswell
+		0x3C | 0x3F | 0x45 | 0x46 |
+		// Skylake / Kaby Lake / Coffee Lake client
+		0x4E | 0x5E | 0x8E | 0x9E
+	)
 }
 
 // Each of the 48 accumulators follows the same depth order as the classical dot.
@@ -93,12 +140,26 @@ unsafe fn tile(a: *const f64, b: *const f64, c: *mut f64, ldc_bytes: usize, dept
 	if flags & FINISH == 0 {
 		partial.cast::<[[f64; MR]; NR]>().write(sums);
 	} else {
+		// Scale and add as two operations, like the general driver's
+		// epilogue: a fused alpha*value + C would round differently.
+		let factor = _mm256_set1_pd(alpha);
 		for (j, col) in sums.iter().enumerate() {
 			let dst = c.byte_add(j * ldc_bytes);
-			for (i, &value) in col.iter().enumerate() {
+			let mut i = 0;
+			while i + 4 <= MR {
+				let scaled = _mm256_mul_pd(factor, _mm256_loadu_pd(col.as_ptr().add(i)));
+				if flags & ADD == 0 {
+					_mm256_storeu_pd(dst.add(i), scaled);
+				} else {
+					_mm256_storeu_pd(dst.add(i), _mm256_add_pd(scaled, _mm256_loadu_pd(dst.add(i))));
+				}
+				i += 4;
+			}
+			while i < MR {
 				let slot = dst.add(i);
-				let scaled = alpha * value;
+				let scaled = alpha * col[i];
 				slot.write(if flags & ADD == 0 { scaled } else { scaled + slot.read() });
+				i += 1;
 			}
 		}
 	}
@@ -276,6 +337,15 @@ unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: us
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn admitted_models_cover_the_measured_families() {
+		assert!(admitted_model(0x3F)); // Haswell-EP, the measured host
+		assert!(admitted_model(0x9E)); // Coffee Lake desktop (i9-9900K)
+		assert!(admitted_model(0x4E)); // Skylake client
+		assert!(!admitted_model(0x55)); // Skylake-SP: AVX-512 dispatch, never here
+		assert!(!admitted_model(0x8F)); // Sapphire Rapids
+	}
 
 	#[test]
 	fn depth_one_suffix_preserves_order_and_padding() {
@@ -459,12 +529,12 @@ mod tests {
 		is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
 	}
 
-	// The gate also demands sixteen scalar updates per L2 element, so the
+	// The gate also demands 128 scalar updates per L2 element, so the
 	// qualifying depth depends on the host's reported L2 size.
 	fn qualifying_depth(m: usize, n: usize) -> usize {
 		let cache = *crate::CACHE_INFO;
 		let l2 = cache[1].cache_bytes / core::mem::size_of::<f64>();
-		(16 * l2).div_ceil(m * n)
+		(crate::packed_avx2::floor_factor() * l2 + 1).div_ceil(m * n)
 	}
 
 	// The gate is the only way into this driver, so a qualifying product must
