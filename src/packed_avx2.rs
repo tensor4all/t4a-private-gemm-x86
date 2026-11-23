@@ -354,6 +354,14 @@ unsafe fn add_rank_one(m: usize, n: usize, a: *const f64, b: *const f64, ldb: us
 	}
 }
 
+/// The depth cap of the lower update: one depth panel, the `kc` that `multiply`
+/// derives from an admitted core's 32 KiB L1 (32 KiB of f64 is 4096 elements,
+/// `4096 / (MR + NR) * 2 / 3 / 16 * 16 == 192`, then bounded by `k`). Both the
+/// driver below and the public wrapper in `lib.rs` refuse a deeper call through
+/// this constant, so the two limits cannot drift apart; a change to `multiply`'s
+/// `kc` formula has to change this too.
+pub(super) const SYRK_DEPTH_PANEL: usize = 32768 / 8 / (MR + NR) * 2 / 3 / 16 * 16;
+
 /// f64 elements `pack_lhs` writes for `rows` rows and depth `k`: whole `MR`-row
 /// tiles, so a partial tile still writes `MR` slots per depth.
 #[inline]
@@ -393,7 +401,7 @@ pub(super) unsafe fn syrk_lower_block(
 	pb: *mut f64,
 ) -> bool {
 	// One depth panel: the Cholesky block updates use k = 16..=192.
-	if k == 0 || k > 192 || lda == 0 || ldc == 0 || rows == 0 || i0 + rows > n {
+	if k == 0 || k > SYRK_DEPTH_PANEL || lda == 0 || ldc == 0 || rows == 0 || i0 + rows > n {
 		return false;
 	}
 	let flags = if beta == Accum::Add { ADD | FINISH } else { FINISH };
@@ -990,9 +998,9 @@ mod tests {
 			}
 		}
 		// a rejected call must leave the destination bit-unchanged and must not
-		// allocate: `k > 192` is outside the driver
+		// allocate: one element past the depth panel is outside the driver
 		let n = 32;
-		let k = 193;
+		let k = SYRK_DEPTH_PANEL + 1;
 		let lda = n;
 		let ldc = n;
 		let l: Vec<f64> = (0..lda * k).map(|i| (i % 7) as f64).collect();
@@ -1012,7 +1020,7 @@ mod tests {
 				n,
 			)
 		};
-		assert!(!ran, "k = 193 is outside the driver");
+		assert!(!ran, "k = {k} is outside the driver");
 		assert!(c.iter().zip(&before).all(|(a, b)| a.to_bits() == b.to_bits()));
 	}
 
@@ -1021,34 +1029,18 @@ mod tests {
 		n + 5
 	}
 
-	// Runs wherever the production gate really admits the host.
+	// The public entry's success path: whole range in one call against three
+	// blocks, the way a team splits the trailing update. The test-only override
+	// skips only the model admission, so this runs on every AVX2+FMA host and
+	// the entry's scratch sizing, block validation and `Accum` plumbing are
+	// exercised where the production gate does and where it does not.
 	#[test]
-	fn syrk_whole_range_and_partitions_are_bit_identical() {
-		// The public entry refuses unless the production gate admits this host
-		// (Intel Haswell / Skylake client), so skip on the same predicate.
-		if !haswell() {
-			return;
-		}
-		syrk_partition_case();
-	}
-
-	// The same success path on any AVX2+FMA host: the test-only override skips
-	// only the model admission, so the entry's scratch sizing, validation and
-	// `Accum` plumbing are exercised on hosts the production gate excludes.
-	#[test]
-	fn syrk_entry_success_path_runs_with_the_gate_forced_on() {
+	fn syrk_entry_whole_range_and_partitions_are_bit_identical() {
 		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 			return;
 		}
-		force_gate(1);
-		let _restore = GateOff::restore();
+		let _forced_on = ForcedGate::new(1);
 		assert!(haswell());
-		syrk_partition_case();
-	}
-
-	fn syrk_partition_case() {
-		// the public entry: whole range in one call against three blocks, the way
-		// a team splits the trailing update
 		for (n, k) in [(96usize, 64usize), (97, 48)] {
 			let lda = n + 3;
 			let ldc = n + 5;
@@ -1079,20 +1071,48 @@ mod tests {
 		}
 	}
 
-	/// Forces the gate off for the current thread and restores it on drop.
-	struct GateOff;
-	impl GateOff {
-		fn new() -> Self {
-			force_gate(-1);
-			GateOff
+	// The scratch is the per-thread buffer, grown once and reused: a repeated
+	// call, and a later smaller one, must not reallocate it.
+	#[test]
+	fn syrk_scratch_is_reused_across_calls() {
+		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+			return;
 		}
+		let _forced_on = ForcedGate::new(1);
+		let (n, k) = (96usize, 64usize);
+		let (lda, ldc) = (n + 3, n + 5);
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+		let mut c = vec![0.5f64; ldc * n];
+		assert!(unsafe {
+			crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Replace, 0, n)
+		});
+		let first = crate::syrk_scratch_probe();
+		assert!(
+			first.0 >= lhs_pack_len(n, k) + 6 * k,
+			"the scratch holds the packed block plus the RHS panel"
+		);
+		assert!(unsafe {
+			crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n)
+		});
+		assert_eq!(crate::syrk_scratch_probe(), first, "a repeated call must reuse the buffer");
+		// a smaller shape is served from the same allocation
+		assert!(unsafe { crate::syrk_lower_block(n, 16, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, Accum::Add, 0, n) });
+		assert_eq!(
+			crate::syrk_scratch_probe(),
+			first,
+			"a smaller shape must not reallocate the buffer"
+		);
+	}
 
-		/// Restores the real gate on drop without changing it now.
-		fn restore() -> Self {
-			GateOff
+	/// Forces the gate for the current thread and restores it on drop.
+	struct ForcedGate;
+	impl ForcedGate {
+		fn new(state: i8) -> Self {
+			force_gate(state);
+			ForcedGate
 		}
 	}
-	impl Drop for GateOff {
+	impl Drop for ForcedGate {
 		fn drop(&mut self) {
 			force_gate(0);
 		}
@@ -1102,7 +1122,7 @@ mod tests {
 	// returns false and leaves `c` (triangles included) untouched.
 	#[test]
 	fn syrk_entry_refuses_and_writes_nothing_when_the_gate_is_off() {
-		let _off = GateOff::new();
+		let _off = ForcedGate::new(-1);
 		assert!(!haswell());
 		let (n, k) = (96usize, 64usize);
 		let (lda, ldc) = (n + 3, n + 5);

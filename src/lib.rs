@@ -1266,6 +1266,23 @@ impl<'a> MilliScratch<'a> {
 	}
 }
 
+// The lower update's scratch: per thread, grown on the first call of a shape
+// and reused from then on, so a steady-state call allocates nothing
+// (tensor4all/faer#111). Sized by the caller from the packer's padded extent.
+thread_local! {
+	static SYRK_MEM: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The current thread's lower-update scratch as `(capacity, data pointer)`: a
+/// repeated call must leave both unchanged, i.e. reuse the allocation.
+#[cfg(test)]
+fn syrk_scratch_probe() -> (usize, *const f64) {
+	SYRK_MEM.with(|mem| {
+		let mem = mem.borrow();
+		(mem.capacity(), mem.as_ptr())
+	})
+}
+
 /// Lower-triangular rank-`k` update `C += alpha * L L^T` for one row block of
 /// `C`, the trailing update of a blocked Cholesky factorization, through the
 /// packed 8x6 AVX2 kernel.
@@ -1281,11 +1298,12 @@ impl<'a> MilliScratch<'a> {
 /// different threads and reach bit-identical results.
 ///
 /// Returns `false` without touching anything when this CPU or shape is outside
-/// the packed driver (a CPU the GEMM gate does not admit, `k == 0`, `k > 192`, a
-/// zero stride, or a block outside `C`); the caller keeps its own product in
-/// that case. The scratch is per thread, [`packed_avx2::lhs_pack_len`]`(rows, k)
-/// + 6 * k` `f64` (the packer writes whole 8-row tiles), grown on demand and
-/// reused, so a steady-state call allocates nothing.
+/// the packed driver (a CPU the GEMM gate does not admit, `k == 0`, a depth
+/// above the driver's one-panel limit, a zero stride, or a block outside `C`);
+/// the caller keeps its own product in that case. The scratch is per thread:
+/// `ceil(rows / 8) * 8 * k` plus `6 * k` `f64` elements (the packer writes whole
+/// 8-row tiles), grown on demand and reused, so a steady-state call allocates
+/// nothing.
 ///
 /// # Safety
 ///
@@ -1316,7 +1334,7 @@ pub unsafe fn syrk_lower_block(
 	// call must not overflow the size arithmetic or grow a buffer.
 	if !packed_avx2::haswell()
 		|| k == 0
-		|| k > 192
+		|| k > packed_avx2::SYRK_DEPTH_PANEL
 		|| lda == 0
 		|| ldc == 0
 		|| rows == 0
@@ -1326,13 +1344,10 @@ pub unsafe fn syrk_lower_block(
 		return false;
 	}
 	let pa_len = packed_avx2::lhs_pack_len(rows, k);
-	// `k <= 192` above, so only the product can overflow.
+	// `k <= SYRK_DEPTH_PANEL` above, so only the product can overflow.
 	let Some(total) = pa_len.checked_add(6 * k) else {
 		return false;
 	};
-	thread_local! {
-		static SYRK_MEM: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
-	}
 	SYRK_MEM.with(|mem| {
 		let mut mem = mem.borrow_mut();
 		if mem.len() < total {
