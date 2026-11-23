@@ -1023,7 +1023,9 @@ mod tests {
 
 	#[test]
 	fn syrk_whole_range_and_partitions_are_bit_identical() {
-		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+		// The public entry refuses unless the production gate admits this host
+		// (Intel Haswell / Skylake client), so skip on the same predicate.
+		if !haswell() {
 			return;
 		}
 		// the public entry: whole range in one call against three blocks, the way
@@ -1055,6 +1057,55 @@ mod tests {
 				whole.iter().zip(&split).all(|(a, b)| a.to_bits() == b.to_bits()),
 				"the row blocks are bit-identical to the whole call, n={n}, k={k}"
 			);
+		}
+	}
+
+	/// Forces the gate off for the current thread and restores it on drop.
+	struct GateOff;
+	impl GateOff {
+		fn new() -> Self {
+			force_gate(-1);
+			GateOff
+		}
+	}
+	impl Drop for GateOff {
+		fn drop(&mut self) {
+			force_gate(0);
+		}
+	}
+
+	// The refusal path, covered on every host: with the gate off the entry
+	// returns false and leaves `c` (triangles included) untouched.
+	#[test]
+	fn syrk_entry_refuses_and_writes_nothing_when_the_gate_is_off() {
+		let _off = GateOff::new();
+		assert!(!haswell());
+		let (n, k) = (96usize, 64usize);
+		let (lda, ldc) = (n + 3, n + 5);
+		let l: Vec<f64> = (0..lda * k).map(|i| ((i % 13) as f64 - 6.) / 5.).collect();
+		let base: Vec<f64> = (0..ldc * n).map(|i| (i % 11) as f64 + 0.25).collect();
+		for beta in [Accum::Add, Accum::Replace] {
+			let mut c = base.clone();
+			let ran = unsafe { crate::syrk_lower_block(n, k, l.as_ptr(), lda, c.as_mut_ptr(), ldc, -1.0, beta, 0, n) };
+			assert!(!ran, "a gate-excluded host must be refused");
+			assert!(
+				c.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
+				"a refused call must not write c"
+			);
+		}
+	}
+
+	// On a host the real gate excludes (AMD, unlisted Intel), the unforced entry
+	// refuses too; where the gate admits, it runs.
+	#[test]
+	fn syrk_entry_follows_the_production_gate() {
+		let (n, k) = (32usize, 8usize);
+		let l = vec![1.0f64; n * k];
+		let mut c = vec![0.0f64; n * n];
+		let ran = unsafe { crate::syrk_lower_block(n, k, l.as_ptr(), n, c.as_mut_ptr(), n, 1.0, Accum::Replace, 0, n) };
+		assert_eq!(ran, haswell());
+		if !ran {
+			assert!(c.iter().all(|&v| v == 0.0));
 		}
 	}
 
