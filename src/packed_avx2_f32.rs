@@ -29,41 +29,22 @@ pub(super) fn gate_hits() -> usize {
 	PROBE.with(|(_, hits)| hits.get())
 }
 
-// Other AVX2 cores have different load ports and cache geometry. Scope this
-// implementation to the Intel family it was measured on.
-//
-// The measured host is Haswell (0x3C/0x3F/0x45/0x46). Skylake through Coffee
-// Lake client (0x4E, 0x5E, 0x8E, 0x9E) keep the same 2-load-port, 32 KiB L1 /
-// 256 KiB L2 core this tile is derived for, so they are admitted as the same
-// family and measured separately (the Skylake-generation desktop in
-// gemm-skylake-lab). AVX-512 hosts never reach this gate: gemm_impl selects
-// InstrSet::Avx512 and the gate requires Avx256.
+// The CPU admission (vendor, family, model, AVX2+FMA) is shared with the f64
+// module; only the test override is local so the f32 tests do not force the
+// f64 gate.
 pub(super) fn haswell() -> bool {
 	#[cfg(test)]
 	match PROBE.with(|(force, _)| force.get()) {
 		0 => {},
 		force => return force > 0,
 	}
-	static HASWELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*HASWELL.get_or_init(|| {
-		let cpuid = raw_cpuid::CpuId::new();
-		cpuid.get_vendor_info().is_some_and(|v| v.as_str() == "GenuineIntel")
-			&& cpuid
-				.get_feature_info()
-				.is_some_and(|f| f.family_id() == 6 && admitted_model(f.model_id()))
-	})
+	super::packed_avx2::haswell()
 }
 
-/// Intel model IDs with the Haswell-style core this tile was derived for.
-#[inline]
-fn admitted_model(model: u8) -> bool {
-	matches!(
-		model,
-		// Haswell / Broadwell
-		0x3C | 0x3F | 0x45 | 0x46 |
-		// Skylake / Kaby Lake / Coffee Lake client
-		0x4E | 0x5E | 0x8E | 0x9E
-	)
+/// The f32 floor is 128 L2 elements (32 MiB of input); it is not the per-family
+/// f64 floor.
+pub(super) fn floor_factor() -> usize {
+	128
 }
 
 // Each of the 48 accumulators follows the same depth order as the classical dot.
@@ -207,7 +188,8 @@ pub(super) unsafe fn multiply(
 	#[cfg(test)]
 	PROBE.with(|(_, hits)| hits.set(hits.get() + 1));
 	// Fit one A and one B micro-panel in two thirds of L1. A row block
-	// then occupies up to half of L2. Haswell's 32/256 KiB gives kc=192, mc=80.
+	// then occupies up to half of L2. With MR=16, NR=6 and a 32/256 KiB
+	// cache this gives kc=240 and mc=128.
 	let kc = (l1 / (MR + NR) * 2 / 3 / 16 * 16).max(16).min(k);
 	let mc = (l2 / kc / 2 / MR * MR).min(alen / kc / MR * MR);
 	let row_pitch = m.next_multiple_of(MR);
@@ -311,15 +293,6 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn admitted_models_cover_the_measured_families() {
-		assert!(admitted_model(0x3F)); // Haswell-EP, the measured host
-		assert!(admitted_model(0x9E)); // Coffee Lake desktop (i9-9900K)
-		assert!(admitted_model(0x4E)); // Skylake client
-		assert!(!admitted_model(0x55)); // Skylake-SP: AVX-512 dispatch, never here
-		assert!(!admitted_model(0x8F)); // Sapphire Rapids
-	}
-
-	#[test]
 	fn depth_one_suffix_preserves_order_and_padding() {
 		if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 			return;
@@ -382,9 +355,9 @@ mod tests {
 		let alpha = -0.27;
 		// Exactly one packed tile per side. Each loop must cross its panel
 		// boundary. Sentinel slots surrounding the capacity are never scratch.
-		let left_len = 96 * 1024;
+		let left_len = MR * 16 + m.next_multiple_of(MR) * NR;
 		let mut left = vec![19.; left_len + 2];
-		let mut right = vec![23.; 32 * 1024 + 2];
+		let mut right = vec![23.; NR * 16 + 2];
 		let mut c = vec![1.; m * n];
 		let mut run = |alen, blen| unsafe {
 			multiply(
@@ -403,13 +376,13 @@ mod tests {
 				alen,
 				right.as_mut_ptr().add(1),
 				blen,
-				4096,
-				32768,
+				32,
+				512,
 			)
 		};
-		assert!(!run(MR * 16 - 1, 32 * 1024));
-		assert!(!run(left_len, NR * 16 - 1));
-		assert!(run(left_len, 32 * 1024));
+		assert!(!run(MR * 16 - 1, NR * 16));
+		assert!(!run(MR * 16, NR * 16 - 1));
+		assert!(run(left_len, NR * 16));
 		for j in 0..n {
 			for i in 0..m {
 				let mut expected = 1.0;
@@ -506,7 +479,7 @@ mod tests {
 	fn qualifying_depth(m: usize, n: usize) -> usize {
 		let cache = *crate::CACHE_INFO;
 		let l2 = cache[1].cache_bytes / core::mem::size_of::<f32>();
-		(128 * l2 + 1).div_ceil(m * n)
+		(crate::packed_avx2_f32::floor_factor() * l2 + 1).div_ceil(m * n)
 	}
 
 	// The gate is the only way into this driver, so a qualifying product must

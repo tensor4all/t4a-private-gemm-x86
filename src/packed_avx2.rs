@@ -32,34 +32,62 @@ pub(super) fn gate_hits() -> usize {
 // Other AVX2 cores have different load ports and cache geometry. Scope this
 // implementation to the Intel family it was measured on.
 //
-// The measured host is Haswell (0x3C/0x3F/0x45/0x46). Skylake through Coffee
-// Lake client (0x4E, 0x5E, 0x8E, 0x9E) keep the same 2-load-port, 32 KiB L1 /
-// 256 KiB L2 core this tile is derived for, so they are admitted as the same
-// family and measured separately (the Skylake-generation desktop in
-// gemm-skylake-lab). AVX-512 hosts never reach this gate: gemm_impl selects
-// InstrSet::Avx512 and the gate requires Avx256.
+// The measured host is Haswell (0x3C/0x3F/0x45/0x46; 0x45/0x46 are
+// Haswell-ULT/GT3e). Skylake through Coffee Lake client (0x4E, 0x5E, 0x8E,
+// 0x9E) keep the same 2-load-port, 32 KiB L1 / 256 KiB L2 core this tile is
+// derived for, so they are admitted as the same family and measured separately
+// (the Skylake-generation desktop in gemm-skylake-lab). AVX-512 hosts never
+// reach this gate: the caller chooses `InstrSet` and this gate requires
+// `Avx256`; none of the admitted model IDs has AVX-512.
 pub(super) fn haswell() -> bool {
 	#[cfg(test)]
 	match PROBE.with(|(force, _)| force.get()) {
 		0 => {},
 		force => return force > 0,
 	}
-	static HASWELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*HASWELL.get_or_init(|| {
-		let cpuid = raw_cpuid::CpuId::new();
-		cpuid.get_vendor_info().is_some_and(|v| v.as_str() == "GenuineIntel")
-			&& cpuid
-				.get_feature_info()
-				.is_some_and(|f| f.family_id() == 6 && admitted_model(f.model_id()))
+	cpu_admitted()
+}
+
+/// The `GenuineIntel` model ID, or `None` when this is not an Intel family-6
+/// part.
+fn cpu_model() -> Option<u8> {
+	let cpuid = raw_cpuid::CpuId::new();
+	cpuid.get_vendor_info()?.as_str().eq("GenuineIntel").then_some(())?;
+	let feature = cpuid.get_feature_info()?;
+	(feature.family_id() == 6).then(|| feature.model_id())
+}
+
+/// The shared CPU admission: the Haswell-style core and the instruction set the
+/// packed driver compiles with.
+pub(super) fn cpu_admitted() -> bool {
+	static ADMITTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ADMITTED.get_or_init(|| {
+		if !std::arch::is_x86_feature_detected!("avx2") || !std::arch::is_x86_feature_detected!("fma") {
+			return false;
+		}
+		cpu_model().is_some_and(admitted_model)
+	})
+}
+
+/// The work floor in units of L2 elements. Haswell keeps the floor measured in
+/// #9; the Skylake client family was measured at 128 on the i9-9900K.
+pub(super) fn floor_factor() -> usize {
+	static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+	*FLOOR.get_or_init(|| {
+		if cpu_model().is_some_and(|m| matches!(m, 0x4E | 0x5E | 0x8E | 0x9E)) {
+			128
+		} else {
+			16
+		}
 	})
 }
 
 /// Intel model IDs with the Haswell-style core this tile was derived for.
 #[inline]
-fn admitted_model(model: u8) -> bool {
+pub(super) fn admitted_model(model: u8) -> bool {
 	matches!(
 		model,
-		// Haswell / Broadwell
+		// Haswell
 		0x3C | 0x3F | 0x45 | 0x46 |
 		// Skylake / Kaby Lake / Coffee Lake client
 		0x4E | 0x5E | 0x8E | 0x9E
@@ -506,7 +534,7 @@ mod tests {
 	fn qualifying_depth(m: usize, n: usize) -> usize {
 		let cache = *crate::CACHE_INFO;
 		let l2 = cache[1].cache_bytes / core::mem::size_of::<f64>();
-		(128 * l2 + 1).div_ceil(m * n)
+		(crate::packed_avx2::floor_factor() * l2 + 1).div_ceil(m * n)
 	}
 
 	// The gate is the only way into this driver, so a qualifying product must
