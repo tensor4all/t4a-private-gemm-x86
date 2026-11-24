@@ -2042,7 +2042,8 @@ fn stack_pages(stack: &mut [core::mem::MaybeUninit<u8>], count: usize) -> Option
 /// It does not depend on the strides, and covers both orientations (the kernel may transpose
 /// the product) and every register blocking `instr` can pick for `dtype`. It is the memory the
 /// thread-local buffer of [`gemm`] holds, and it does not grow with the shape: the drivers
-/// block the product to fit it. It is 0 for an empty product.
+/// block the product to fit it. It is 0 exactly when `nrows == 0 || ncols == 0`; otherwise
+/// it is the full bound even for `depth == 0`, so one bound covers every accumulation.
 pub fn gemm_stack_bytes(dtype: DType, instr: InstrSet, nrows: usize, ncols: usize, depth: usize) -> usize {
 	let _ = (instr, depth);
 	if nrows == 0 || ncols == 0 {
