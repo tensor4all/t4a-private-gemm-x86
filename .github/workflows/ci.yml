@@ -26,6 +26,10 @@ jobs:
       - name: A warm workspace allocates nothing
         # this binary holds one `#[test]`, so no other test thread allocates while it counts
         run: cargo test --test job_alloc -- --nocapture --test-threads=1
+      - name: Packing memory from the caller, first call on a fresh thread
+        # one test at a time: the tests share the allocation counter; each instruction set the
+        # runner lacks is skipped with a line on stdout
+        run: cargo test --test with_stack -- --nocapture --test-threads=1
       - name: Classical f64/f32 packed panels and padded edges
         # the packed drivers' comparisons live in the unit tests: an integration test cannot
         # force the dispatch gate, so on a non-Haswell runner it would only test the general driver.

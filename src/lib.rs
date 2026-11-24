@@ -1423,6 +1423,7 @@ pub unsafe fn gemm_with_scratch(
 			fork.width().max(1),
 			Some(fork),
 			Some(scratch),
+			None,
 		)
 	}
 }
@@ -1475,6 +1476,7 @@ pub unsafe fn gemm_with(
 			fork.width().max(1),
 			Some(fork),
 			None,
+			None,
 		)
 	}
 }
@@ -1521,6 +1523,7 @@ pub unsafe fn gemm(
 			n_threads,
 			None,
 			None,
+			None,
 		)
 	}
 }
@@ -1561,6 +1564,7 @@ unsafe fn gemm_impl(
 	n_threads: usize,
 	fork: Option<&dyn Fork>,
 	mut scratch: Option<MilliScratch<'_>>,
+	stack: Option<&mut [core::mem::MaybeUninit<u8>]>,
 ) {
 	let (sizeof, cplx) = match dtype {
 		DType::F32 => (4, false),
@@ -1662,11 +1666,7 @@ unsafe fn gemm_impl(
 	let l2 = cache[1].cache_bytes / sizeof;
 	let l3 = cache[2].cache_bytes / sizeof;
 
-	#[repr(align(4096))]
-	struct Page([u8; 4096]);
-
-	let lhs_size = (l3.next_multiple_of(16) * sizeof).div_ceil(size_of::<Page>());
-	let rhs_size = (l3.next_multiple_of(nr) * sizeof).div_ceil(size_of::<Page>());
+	let (lhs_size, rhs_size) = pack_pages(sizeof, nr);
 
 	thread_local! {
 		static MEM: RefCell<Vec::<core::mem::MaybeUninit<Page>>> = {
@@ -1682,26 +1682,10 @@ unsafe fn gemm_impl(
 		};
 	}
 
-	MEM.with(|mem| {
-		let mut storage;
-		let mut alloc;
-
-		let mem = match mem.try_borrow_mut() {
-			Ok(mem) => {
-				storage = mem;
-				&mut *storage
-			},
-			Err(_) => {
-				alloc = Vec::with_capacity(lhs_size + rhs_size);
-
-				&mut alloc
-			},
-		};
-		if mem.len() < lhs_size + rhs_size {
-			mem.reserve_exact(lhs_size + rhs_size);
-			unsafe { mem.set_len(lhs_size + rhs_size) };
-		}
-
+	// The packing memory: `lhs_size + rhs_size` pages, from the caller's stack when there is one
+	// (`gemm_with_stack`), else from this thread's `MEM`. Both hand the drivers the same
+	// capacities, so the blocking, and the result, are the same.
+	let mut run = |mem: &mut [core::mem::MaybeUninit<Page>]| {
 		let (packed_lhs, packed_rhs) = mem.split_at_mut(lhs_size);
 		let (packed_rhs, _) = packed_rhs.split_at_mut(rhs_size);
 		// Amortize packing over at least four microtiles in each direction.
@@ -1994,7 +1978,150 @@ unsafe fn gemm_impl(
 			#[cfg(not(feature = "rayon"))]
 			f();
 		}
+	};
+
+	if let Some(stack) = stack {
+		let pages = stack_pages(stack, lhs_size + rhs_size).expect("gemm_with_stack: the stack is shorter than gemm_stack_bytes");
+		run(pages);
+		return;
+	}
+
+	MEM.with(|mem| {
+		let mut storage;
+		let mut alloc;
+
+		let mem = match mem.try_borrow_mut() {
+			Ok(mem) => {
+				storage = mem;
+				&mut *storage
+			},
+			Err(_) => {
+				alloc = Vec::with_capacity(lhs_size + rhs_size);
+
+				&mut alloc
+			},
+		};
+		if mem.len() < lhs_size + rhs_size {
+			mem.reserve_exact(lhs_size + rhs_size);
+			unsafe { mem.set_len(lhs_size + rhs_size) };
+		}
+		run(mem);
 	});
+}
+
+#[repr(align(4096))]
+struct Page([u8; 4096]);
+
+/// The pages of packed lhs and packed rhs `gemm_impl` uses for elements of `sizeof` bytes and
+/// register blocks `nr` columns wide: one L3 each (the lhs rounded to 16 rows, the rhs to `nr`
+/// columns). They do not depend on the shape.
+fn pack_pages(sizeof: usize, nr: usize) -> (usize, usize) {
+	let l3 = cache::CACHE_INFO[2].cache_bytes / sizeof;
+	let lhs_size = (l3.next_multiple_of(16) * sizeof).div_ceil(size_of::<Page>());
+	let rhs_size = (l3.next_multiple_of(nr) * sizeof).div_ceil(size_of::<Page>());
+	(lhs_size, rhs_size)
+}
+
+/// `count` pages at the first page boundary of `stack`, or `None` when it is too short.
+fn stack_pages(stack: &mut [core::mem::MaybeUninit<u8>], count: usize) -> Option<&mut [core::mem::MaybeUninit<Page>]> {
+	let skip = stack.as_mut_ptr().align_offset(align_of::<Page>());
+	let bytes = count.checked_mul(size_of::<Page>())?;
+	if skip > stack.len() || stack.len() - skip < bytes {
+		return None;
+	}
+	// SAFETY: `skip + count * 4096 <= stack.len()`, the start is aligned for `Page`, and a
+	// `MaybeUninit<Page>` is valid for any bytes, initialised or not; the slice borrows `stack`.
+	Some(unsafe { core::slice::from_raw_parts_mut(stack.as_mut_ptr().add(skip).cast(), count) })
+}
+
+/// Bytes of caller memory [`gemm_with_stack`] needs for a `nrows x ncols` product of depth
+/// `depth` of `dtype` with `instr`: the packing memory of one thread (one L3 for the packed lhs,
+/// one for the packed rhs, in 4096-byte pages) plus 4095 bytes to align it, so that any
+/// `&mut [MaybeUninit<u8>]` of this length will do.
+///
+/// It does not depend on the strides, and covers both orientations (the kernel may transpose
+/// the product) and every register blocking `instr` can pick for `dtype`. It is the memory the
+/// thread-local buffer of [`gemm`] holds, and it does not grow with the shape: the drivers
+/// block the product to fit it. It is 0 for an empty product.
+pub fn gemm_stack_bytes(dtype: DType, instr: InstrSet, nrows: usize, ncols: usize, depth: usize) -> usize {
+	let _ = (instr, depth);
+	if nrows == 0 || ncols == 0 {
+		return 0;
+	}
+	let sizeof = match dtype {
+		DType::F32 => 4,
+		DType::F64 => 8,
+		DType::C32 => 8,
+		DType::C64 => 16,
+	};
+	// `nr` is 4, or 8 for the narrow AVX-512 `f64` kernel; the wider rounding bounds both
+	let (lhs_size, rhs_size) = pack_pages(sizeof, 8);
+	(lhs_size + rhs_size) * size_of::<Page>() + (align_of::<Page>() - 1)
+}
+
+/// [`gemm`] on one thread, with the packing memory taken from `stack` instead of the
+/// thread-local buffer: the call does not allocate, from a thread's first call on, provided
+/// `stack` holds [`gemm_stack_bytes`] bytes. It runs the same drivers with the same blocking as
+/// [`gemm`] with `n_threads == 1`, so the result is bit-for-bit the same.
+///
+/// # Safety
+///
+/// The same as [`gemm`].
+///
+/// # Panics
+///
+/// When `stack` is shorter than [`gemm_stack_bytes`]`(dtype, instr, nrows, ncols, depth)`,
+/// before `dst` is written.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_with_stack(
+	dtype: DType,
+	itype: IType,
+
+	instr: InstrSet,
+	nrows: usize,
+	ncols: usize,
+	depth: usize,
+
+	dst: *mut (),
+	dst_rs: isize,
+	dst_cs: isize,
+	dst_row_idx: *const (),
+	dst_col_idx: *const (),
+	dst_kind: DstKind,
+
+	beta: Accum,
+
+	lhs: *const (),
+	lhs_rs: isize,
+	lhs_cs: isize,
+	conj_lhs: bool,
+
+	real_diag: *const (),
+	diag_stride: isize,
+
+	rhs: *const (),
+	rhs_rs: isize,
+	rhs_cs: isize,
+	conj_rhs: bool,
+
+	alpha: *const (),
+
+	stack: &mut [core::mem::MaybeUninit<u8>],
+) {
+	assert!(
+		stack.len() >= gemm_stack_bytes(dtype, instr, nrows, ncols, depth),
+		"gemm_with_stack: the stack is shorter than gemm_stack_bytes"
+	);
+	unsafe {
+		gemm_impl(
+			dtype, itype, instr, nrows, ncols, depth, dst, dst_rs, dst_cs, dst_row_idx, dst_col_idx, dst_kind, beta, lhs, lhs_rs, lhs_cs,
+			conj_lhs, real_diag, diag_stride, rhs, rhs_rs, rhs_cs, conj_rhs, alpha,
+			1,
+			None,
+			None,
+			Some(stack),
+		)
+	}
 }
 
 pub unsafe fn kernel(
