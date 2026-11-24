@@ -6,7 +6,8 @@
 //! process-wide one-time set-up (the cache sizes, the CPU feature checks) is done once on the
 //! main thread first: it is not per thread, so it is not what this test is about. Each
 //! instruction set the host lacks is skipped with a line on stdout. Run it with
-//! `cargo test --test with_stack -- --nocapture --test-threads=1`.
+//! `cargo test --release --test with_stack -- --nocapture --test-threads=1` (unoptimised, the
+//! 96 MiB shapes take most of an hour).
 
 #![cfg(target_arch = "x86_64")]
 
