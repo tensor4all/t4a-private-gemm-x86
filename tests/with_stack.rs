@@ -229,18 +229,26 @@ fn first_call_on_a_fresh_thread_allocates_nothing() {
 					let c = case(m, n, k, dst_row_major, lhs_row_major);
 					let mut ops = Operands::new(dtype, c);
 					let mut stack = stack_for(dtype, instr, c);
-					let n_alloc = std::thread::scope(|s| {
+					let (n_alloc, total) = std::thread::scope(|s| {
 						s.spawn(|| {
 							let before = ALLOCS.load(Ordering::Relaxed);
 							COUNTED.with(|f| f.set(true));
 							unsafe { product(dtype, instr, c, &mut ops, Some(&mut stack)) };
+							let n_alloc = ALLOCS.load(Ordering::Relaxed) - before;
+							// Positive control: one known allocation in this same counted
+							// region, so a counter that was never armed cannot pass as 0.
+							std::hint::black_box(Box::new(0u64));
 							COUNTED.with(|f| f.set(false));
-							ALLOCS.load(Ordering::Relaxed) - before
+							(n_alloc, ALLOCS.load(Ordering::Relaxed) - before)
 						})
 						.join()
 						.unwrap()
 					});
 					assert_eq!(n_alloc, 0, "{dtype:?} {instr:?} {c:?}");
+					assert_eq!(
+						total, 1,
+						"the allocation counter was not armed: {dtype:?} {instr:?} {c:?}"
+					);
 				}
 			}
 		}
