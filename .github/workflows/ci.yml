@@ -13,19 +13,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --profile ci --all-targets
       - name: Triangular destinations, both instruction sets
         # The test names `InstrSet` explicitly, so an AVX-512 runner covers the 256-bit path
         # (the one that used to write below the diagonal) and an AVX2-only runner covers it
         # directly. Each test prints a skip line when its instruction set is absent.
-        run: cargo test --test triangular_dst -- --nocapture
+        run: cargo test --profile ci --test triangular_dst -- --nocapture
       - name: Diagonal product with reversed depth, both instruction sets
-        run: cargo test --test diag_reversed_depth -- --nocapture
+        run: cargo test --profile ci --test diag_reversed_depth -- --nocapture
       - name: Job tables borrowed from a caller-owned workspace
-        run: cargo test --test job_scratch
+        run: cargo test --profile ci --test job_scratch
       - name: A warm workspace allocates nothing
         # this binary holds one `#[test]`, so no other test thread allocates while it counts
-        run: cargo test --test job_alloc -- --nocapture --test-threads=1
+        run: cargo test --profile ci --test job_alloc -- --nocapture --test-threads=1
       - name: Packing memory from the caller, first call on a fresh thread
         # one test at a time: the tests share the allocation counter; each instruction set the
         # runner lacks is skipped with a line on stdout. Release: the 96 MiB shapes took 48 min
@@ -36,8 +36,8 @@ jobs:
         # force the dispatch gate, so on a non-Haswell runner it would only test the general driver.
         # The `packed_avx2` filter selects both packed_avx2 and packed_avx2_f32.
         run: |
-          cargo test --lib packed_avx2
-          cargo test --test avx256_f64_depth
+          cargo test --profile ci --lib packed_avx2
+          cargo test --profile ci --test avx256_f64_depth
       - name: The mixed-instruction GEMM test runs its AVX256 arm
         # This test SIGILLed on AVX2-only hosts before the feature gate; running it on
         # every push is the regression guard for #16. Release keeps the scalar reference
@@ -47,4 +47,4 @@ jobs:
         # The crate's own suite is the author's and takes many minutes per shape; it is not
         # what this branch changed, so it runs on demand rather than on every push.
         if: github.event_name == 'workflow_dispatch'
-        run: cargo test
+        run: cargo test --profile ci
