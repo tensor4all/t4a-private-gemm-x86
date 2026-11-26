@@ -52,9 +52,13 @@ interpol = "0.2.1"
 # "Build Profiles And Target Hygiene"); `debug-assertions` and `overflow-checks` stay on.
 [profile.dev]
 debug = 0
+debug-assertions = true
+overflow-checks = true
 
 [profile.test]
 debug = 0
+debug-assertions = true
+overflow-checks = true
 
 # CI builds and tests with this profile (tensor4all-agent-rules, rules/common/repository.md,
 # "Build Profiles"). It inherits `test`, not `release`, so the debug-mode steps of `ci.yml` keep
@@ -62,7 +66,9 @@ debug = 0
 # masked-store offset clamp, the triangular destination, the reversed depth stride) are
 # out-of-bounds pointer arithmetic, and the standard library's unsafe-precondition checks and
 # integer overflow checks only run with those on. The steps that need optimised code
-# (`with_stack`'s 96 MiB shapes, `tests_f64::test_gemm`) keep `--release` on purpose.
+# (`with_stack`'s 96 MiB shapes, `tests_f64::test_gemm`) keep `--release` on purpose: unoptimised they
+# took 48 min (see `ci.yml`), so they test the shipped configuration and the kernels' bounds are
+# covered by the debug-mode steps above.
 [profile.ci]
 inherits = "test"
 incremental = false
