@@ -48,16 +48,22 @@ gemm = "0.19.0"          # crates.io release; the tests only need `gemm`, `c64`,
 defer = "0.2.1"
 interpol = "0.2.1"
 
+# No default profile carries debug info (tensor4all-agent-rules, rules/rust/performance.md,
+# "Build Profiles And Target Hygiene"); `debug-assertions` and `overflow-checks` stay on.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
 # CI builds and tests with this profile (tensor4all-agent-rules, rules/common/repository.md,
 # "Build Profiles"). It inherits `test`, not `release`, so the debug-mode steps of `ci.yml` keep
 # testing with `debug-assertions` and `overflow-checks` on: the fixes this fork carries (the
 # masked-store offset clamp, the triangular destination, the reversed depth stride) are
 # out-of-bounds pointer arithmetic, and the standard library's unsafe-precondition checks and
 # integer overflow checks only run with those on. The steps that need optimised code
-# (`with_stack`'s 96 MiB shapes, `tests_f64::test_gemm`) keep `--release` on purpose. `debug = 0`
-# is set because nothing above sets it and the default debug info is what this profile drops.
+# (`with_stack`'s 96 MiB shapes, `tests_f64::test_gemm`) keep `--release` on purpose.
 [profile.ci]
 inherits = "test"
-debug = 0
 incremental = false
 strip = "symbols"
