@@ -4,6 +4,8 @@ use core::arch::x86_64::{_mm256_mul_pd, _mm256_add_pd, _mm256_fmadd_pd, _mm256_l
 #[cfg(test)]
 use core::cell::Cell;
 
+mod stream_rhs;
+
 const MR: usize = 8;
 const NR: usize = 6;
 const ADD: usize = 1;
@@ -67,6 +69,28 @@ pub(super) fn cpu_admitted() -> bool {
 		}
 		cpu_model().is_some_and(admitted_model)
 	})
+}
+
+type Driver = unsafe fn(
+	usize, usize, usize, *const f64, usize, *const f64, usize, *mut f64, usize,
+	f64, Accum, *mut f64, usize, *mut f64, usize, usize, usize,
+) -> bool;
+
+pub(super) fn gemm_driver() -> Option<Driver> {
+	if haswell() {
+		return Some(multiply);
+	}
+	#[cfg(test)]
+	if PROBE.with(|(force, _)| force.get() < 0) {
+		return None;
+	}
+	static RAPTOR_LAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	if !*RAPTOR_LAKE.get_or_init(|| cpu_model() == Some(0xB7) && std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+		return None;
+	}
+	// Core type is per logical CPU on a hybrid package. Both core types support
+	// this instruction set, but the streaming schedule was measured on the P-core.
+	(raw_cpuid::cpuid!(0x1a).eax >> 24 == 0x40).then_some(stream_rhs::multiply)
 }
 
 /// The work floor in units of L2 elements. Haswell keeps the floor measured in

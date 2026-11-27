@@ -184,3 +184,44 @@ fn f64_window_near_the_l2_panel_boundary() {
 		}
 	}
 }
+
+#[test]
+fn overwrite_windows_cover_staged_panels_and_fringe_tiles() {
+	if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+		return;
+	}
+	let alpha = [1.0_f64.to_bits()];
+	let dtype = DType::F64;
+	let instr = InstrSet::Avx256;
+	for (m, n, k) in [
+		(511, 511, 511),
+		(512, 512, 512),
+		(513, 513, 513),
+		(463, 59, 509),
+		(501, 1003, 1025),
+		(473, 419, 504),
+		(259, 515, 507),
+		(497, 52, 512),
+	] {
+		let lda = m + 3;
+		let lhs = values(dtype, lda * k, 71);
+		let rhs = values(dtype, k * n, 19);
+		let whole = product(dtype, instr, (m, n, k), &lhs, 0, lda, &rhs, 0, &alpha);
+		for i0 in [0, 217.min(m - 13), m - 13] {
+			for j0 in [0, n / 2, n - 11] {
+				let window = product(dtype, instr, (13, 11, k), &lhs, i0, lda, &rhs, j0 * k, &alpha);
+				for j in 0..11 {
+					for i in 0..13 {
+						assert_eq!(
+							window[i + j * 13],
+							whole[(i + i0) + (j + j0) * m],
+							"shape {m}x{k}x{n} at {},{}",
+							i0 + i,
+							j0 + j
+						);
+					}
+				}
+			}
+		}
+	}
+}
