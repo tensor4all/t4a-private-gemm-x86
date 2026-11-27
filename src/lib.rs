@@ -1844,7 +1844,15 @@ unsafe fn gemm_impl(
 					diag_stride: real_diag_stride,
 				};
 
-				if n_threads <= 1 && !rowmajor && m < l2 && n < l2 {
+				// The packed left panel uses complete MR-row tiles. Each sweep also
+				// reads one NR-column right micro-panel at the current depth.
+				let fits_packed_lhs = instr != InstrSet::Avx256 || dtype != DType::F64 || !pack_lhs
+					|| {
+						// Keep one L2 way available to the streaming output and other resident lines.
+						let available = l2.saturating_sub(l2.div_ceil(cache[1].associativity.max(1)));
+						m <= available.saturating_sub(nr) / mr * mr
+					};
+				if n_threads <= 1 && !rowmajor && m < l2 && n < l2 && fits_packed_lhs {
 					let microkernel = microkernel[nr - 1];
 					let pack = pack[0];
 					millikernel_colmajor(

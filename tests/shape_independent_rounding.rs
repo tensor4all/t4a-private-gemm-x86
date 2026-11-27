@@ -173,3 +173,14 @@ fn window_of_a_product_large_enough_for_the_packed_driver() {
 		}
 	}
 }
+
+/// Near the compact-driver L2 limit a whole product and its smaller window can
+/// choose different output traversals. Include a full and a partial depth block.
+#[test]
+fn f64_window_near_the_l2_panel_boundary() {
+	if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+		for depth in [501, 512, 513, 1025] {
+			window_matches_whole(DType::F64, InstrSet::Avx256, (487, 419, depth), (11, 57), (19, 47));
+		}
+	}
+}
