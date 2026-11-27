@@ -31,6 +31,10 @@ jobs:
         # runner lacks is skipped with a line on stdout. Release: the 96 MiB shapes took 48 min
         # unoptimised.
         run: cargo test --release --test with_stack -- --nocapture --test-threads=1
+      - name: A window of a product rounds as the whole product (#24)
+        # Both instruction sets the runner has, with a skip line for each it lacks: the f64
+        # AVX-512 kernel choice (`nrows > 48`) runs only on an AVX-512 runner.
+        run: cargo test --profile ci --test shape_independent_rounding -- --nocapture
       - name: Classical f64/f32 packed panels and padded edges
         # the packed drivers' comparisons live in the unit tests: an integration test cannot
         # force the dispatch gate, so on a non-Haswell runner it would only test the general driver.
