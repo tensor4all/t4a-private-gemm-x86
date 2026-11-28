@@ -4,6 +4,9 @@ use core::arch::x86_64::{_mm256_mul_pd, _mm256_add_pd, _mm256_fmadd_pd, _mm256_l
 #[cfg(test)]
 use core::cell::Cell;
 
+#[cfg(feature = "bench-internals")]
+pub(crate) mod bench;
+
 const MR: usize = 8;
 const NR: usize = 6;
 const ADD: usize = 1;

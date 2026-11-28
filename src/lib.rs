@@ -28,6 +28,12 @@ pub struct Position {
 
 mod cache;
 mod packed_avx2;
+/// Benchmark-only access to private kernels (`--features bench-internals`). Not part of the API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_internals {
+	pub use crate::packed_avx2::bench::*;
+}
 mod packed_avx2_f32;
 
 /// Runs the process-wide cache probe now instead of inside the first product (faer#232).
