@@ -17,6 +17,25 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use cache::CACHE_INFO;
 
+/// The one way Rust calls into the generated assembly: the indirect call, then `vzeroupper`.
+///
+/// The kernels use `ymm`/`zmm` registers and return with the upper vector state dirty; left that
+/// way, legacy-SSE code that runs next on the thread (compiled scalar `f64`) pays a false
+/// dependency on every destination (#31). The registers are dead after the call (the callers list
+/// them as clobbered), so clearing here loses nothing and costs one instruction per call. The
+/// call chains inside the generated code are not touched. `tests/vector_state.rs` fails if this
+/// macro loses its `vzeroupper`, or if an indirect call appears in `src/` outside it.
+macro_rules! call_kernel {
+	($($operands:tt)*) => {
+		core::arch::asm! {
+			"call r10",
+			"vzeroupper",
+			$($operands)*
+		}
+	};
+}
+// end call_kernel
+
 include!(concat!(env!("OUT_DIR"), "/asm.rs"));
 
 #[derive(Copy, Clone, Debug)]
@@ -129,9 +148,7 @@ pub unsafe fn call_microkernel(
 	position: &mut Position,
 ) -> (usize, usize) {
 	unsafe {
-		core::arch::asm! {
-			"call r10",
-
+		call_kernel! {
 			in("rax") lhs,
 			in("r15") packed_lhs,
 			in("rcx") rhs,
@@ -616,8 +633,7 @@ unsafe fn pack_lhs(pack: unsafe extern "C" fn(), milli: &MillikernelInfo, row_ch
 	unsafe {
 		{
 			let mut dst_cs = row_chunk;
-			core::arch::asm! {
-				"call r10",
+			call_kernel! {
 				in("r10") pack,
 				in("rax") lhs,
 				in("r15") packed_lhs,
@@ -3749,9 +3765,7 @@ mod transpose_tests {
 			};
 
 			unsafe {
-				core::arch::asm! {"
-                call r10
-                ",
+				call_kernel! {
 					in("r10") ptr,
 					in("rax") src.as_ptr(),
 					in("r15") dst.as_mut_ptr(),
@@ -3804,9 +3818,7 @@ mod transpose_tests {
 			};
 
 			unsafe {
-				core::arch::asm! {"
-                call r10
-                ",
+				call_kernel! {
 					in("r10") ptr,
 					in("rax") src.as_ptr(),
 					in("r15") dst.as_mut_ptr(),
@@ -3859,9 +3871,7 @@ mod transpose_tests {
 			};
 
 			unsafe {
-				core::arch::asm! {"
-                call r10
-                ",
+				call_kernel! {
 					in("r10") ptr,
 					in("rax") src.as_ptr(),
 					in("r15") dst.as_mut_ptr(),
