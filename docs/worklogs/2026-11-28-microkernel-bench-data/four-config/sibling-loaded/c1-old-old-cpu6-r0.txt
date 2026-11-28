@@ -1,0 +1,24 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 6 (verified single CPU)
+core       : cpu6 (smt sibling 6,18), L3 8192K shared by 4-11,16-23, L2 1024K
+ran on cpu : 6 (sched_getcpu at start)
+commit     : c1-old-old+sibling-loaded
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 1572864
+clock      : measured 1.737 GHz (dependent-add chain), used for peak 1.737 GHz
+peak/core  : 16 flop/cycle x 1.737 GHz = 27.79 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : false   stream tile: false
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+driver   packed driver (multiply)           191x257x139          515826.0     26.46    95.2%
+driver   packed driver (multiply)           192x257x139          518571.0     26.45    95.2%
+driver   packed driver (multiply)           256x256x256         1183133.5     28.36   102.0%
+driver   packed driver (multiply)           511x511x511         9362770.0     28.50   102.6%
+driver   packed driver (multiply)           512x512x512         9382136.0     28.61   102.9%
+driver   packed driver (multiply)           256x32x256           156687.5     26.77    96.3%
+driver   packed driver (multiply)           256x512x256         2354606.0     28.50   102.5%
+driver   packed driver (multiply)           256x513x256         2366889.0     28.41   102.2%
+
+%peak = GFLOP/s / (16 flop/cycle x 1.737 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).
