@@ -1,0 +1,48 @@
+pre r0 cpu2(16384K) c1-old-old: sibling cpu14 busy 0%
+post r0 cpu2 c1-old-old: sibling busy over run 0%
+pre r0 cpu2(16384K) c2-newtile-oldpacked: sibling cpu14 busy 0%
+post r0 cpu2 c2-newtile-oldpacked: sibling busy over run 0%
+pre r0 cpu2(16384K) c3-oldtile-stream: sibling cpu14 busy 0%
+post r0 cpu2 c3-oldtile-stream: sibling busy over run 0%
+pre r0 cpu2(16384K) c4-new-new: sibling cpu14 busy 0%
+post r0 cpu2 c4-new-new: sibling busy over run 0%
+pre r0 cpu6(8192K) c1-old-old: sibling cpu18 busy 0%
+post r0 cpu6 c1-old-old: sibling busy over run 0%
+pre r0 cpu6(8192K) c2-newtile-oldpacked: sibling cpu18 busy 0%
+post r0 cpu6 c2-newtile-oldpacked: sibling busy over run 0%
+pre r0 cpu6(8192K) c3-oldtile-stream: sibling cpu18 busy 0%
+post r0 cpu6 c3-oldtile-stream: sibling busy over run 0%
+pre r0 cpu6(8192K) c4-new-new: sibling cpu18 busy 0%
+post r0 cpu6 c4-new-new: sibling busy over run 0%
+pre r1 cpu6(8192K) c2-newtile-oldpacked: sibling cpu18 busy 0%
+post r1 cpu6 c2-newtile-oldpacked: sibling busy over run 0%
+pre r1 cpu6(8192K) c3-oldtile-stream: sibling cpu18 busy 0%
+post r1 cpu6 c3-oldtile-stream: sibling busy over run 0%
+pre r1 cpu6(8192K) c4-new-new: sibling cpu18 busy 0%
+post r1 cpu6 c4-new-new: sibling busy over run 0%
+pre r1 cpu6(8192K) c1-old-old: sibling cpu18 busy 0%
+post r1 cpu6 c1-old-old: sibling busy over run 0%
+pre r1 cpu2(16384K) c2-newtile-oldpacked: sibling cpu14 busy 0%
+post r1 cpu2 c2-newtile-oldpacked: sibling busy over run 0%
+pre r1 cpu2(16384K) c3-oldtile-stream: sibling cpu14 busy 0%
+post r1 cpu2 c3-oldtile-stream: sibling busy over run 0%
+pre r1 cpu2(16384K) c4-new-new: sibling cpu14 busy 0%
+post r1 cpu2 c4-new-new: sibling busy over run 0%
+pre r1 cpu2(16384K) c1-old-old: sibling cpu14 busy 0%
+post r1 cpu2 c1-old-old: sibling busy over run 0%
+pre r2 cpu2(16384K) c3-oldtile-stream: sibling cpu14 busy 0%
+post r2 cpu2 c3-oldtile-stream: sibling busy over run 0%
+pre r2 cpu2(16384K) c4-new-new: sibling cpu14 busy 0%
+post r2 cpu2 c4-new-new: sibling busy over run 0%
+pre r2 cpu2(16384K) c1-old-old: sibling cpu14 busy 0%
+post r2 cpu2 c1-old-old: sibling busy over run 0%
+pre r2 cpu2(16384K) c2-newtile-oldpacked: sibling cpu14 busy 0%
+post r2 cpu2 c2-newtile-oldpacked: sibling busy over run 0%
+pre r2 cpu6(8192K) c3-oldtile-stream: sibling cpu18 busy 0%
+post r2 cpu6 c3-oldtile-stream: sibling busy over run 0%
+pre r2 cpu6(8192K) c4-new-new: sibling cpu18 busy 0%
+post r2 cpu6 c4-new-new: sibling busy over run 0%
+pre r2 cpu6(8192K) c1-old-old: sibling cpu18 busy 0%
+post r2 cpu6 c1-old-old: sibling busy over run 0%
+pre r2 cpu6(8192K) c2-newtile-oldpacked: sibling cpu18 busy 0%
+post r2 cpu6 c2-newtile-oldpacked: sibling busy over run 0%
