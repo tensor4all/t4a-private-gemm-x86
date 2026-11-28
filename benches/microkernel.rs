@@ -267,7 +267,7 @@ fn main() {
 
 	// Driver-only: the whole driver (pack + traversal + tiles) with scratch preallocated, no public dispatch.
 	// End-to-end: the public `gemm` (dispatch included), default instruction set and forced AVX2.
-	let shapes: &[(usize, usize, usize)] = &[(191, 257, 139), (192, 257, 139), (256, 256, 256), (511, 511, 511), (512, 512, 512)];
+	let shapes: &[(usize, usize, usize)] = &[(191, 257, 139), (192, 257, 139), (256, 256, 256), (511, 511, 511), (512, 512, 512), (256, 32, 256), (256, 512, 256), (256, 513, 256)];
 	let pa_len = l3.next_multiple_of(16);
 	let pb_len = l3.next_multiple_of(nr);
 	let mut pa = vec![0.0f64; pa_len];
@@ -317,6 +317,30 @@ fn main() {
 				});
 				// peak for Avx512 would double; report against the AVX2 denominator and say so.
 				c.row("e2e", name, &shape, ns, flops);
+			}
+		}
+	}
+	if want("scratch") {
+		// Which scratch does each driver write? Buffers are calloc'd and untouched, so RSS growth
+		// counts only pages the call writes. `pa` holds packed A, `pb` packed B (or the dense tail rows).
+		println!();
+		println!("scratch  driver                             shape            pa_written_KiB pb_written_KiB  rss_delta_KiB");
+		for &(m, kk, n) in &[(191usize, 257usize, 139usize), (512, 512, 512)] {
+			let a = vec(m * kk, &mut seed);
+			let b = vec(kk * n, &mut seed);
+			let drivers: Vec<(&str, k::Driver)> = std::iter::once(("packed driver (multiply)", k::packed_driver()))
+				.chain(k::stream_driver().map(|d| ("stream driver (stream_rhs)", d)))
+				.collect();
+			for (name, d) in drivers {
+				let mut out = vec![f64::NAN; m * n];
+				let mut spa = vec![0.0f64; pa_len];
+				let mut spb = vec![0.0f64; pb_len];
+				let rss = || -> i64 { sh("awk '/^VmRSS/{print $2}' /proc/self/status").parse().unwrap_or(-1) };
+				let r0 = rss();
+				let ok = unsafe { d(m, n, kk, a.as_ptr(), m, b.as_ptr(), kk, out.as_mut_ptr(), m, 1.0, Accum::Replace, spa.as_mut_ptr(), pa_len, spb.as_mut_ptr(), pb_len, l1, l2) };
+				let r1 = rss();
+				let w = |v: &[f64]| v.iter().filter(|x| **x != 0.0).count() * 8 / 1024;
+				println!("scratch  {name:<34} {:<16} {:>14} {:>14} {:>14}{}", format!("{m}x{kk}x{n}"), w(&spa), w(&spb), r1 - r0, if ok { "" } else { "  (refused)" });
 			}
 		}
 	}
