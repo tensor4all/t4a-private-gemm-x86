@@ -1713,31 +1713,32 @@ unsafe fn gemm_impl(
 					if dst_rs == 8
 						&& lhs_rs == 8
 						&& rhs_rs == 8
-						&& packed_avx2::haswell()
 						&& m.saturating_mul(n).saturating_mul(depth)
 							> l2.saturating_mul(packed_avx2::floor_factor()) =>
 				{
-					let used = packed_avx2::multiply(
-						m,
-						n,
-						depth,
-						lhs.cast(),
-						lhs_cs as usize / 8,
-						rhs.cast(),
-						rhs_cs as usize / 8,
-						dst.cast(),
-						dst_cs as usize / 8,
-						*alpha.cast::<f64>(),
-						beta,
-						packed_lhs.as_mut_ptr().cast(),
-						core::mem::size_of_val(packed_lhs) / size_of::<f64>(),
-						packed_rhs.as_mut_ptr().cast(),
-						core::mem::size_of_val(packed_rhs) / size_of::<f64>(),
-						l1,
-						l2,
-					);
-					if used {
-						return;
+					if let Some(driver) = packed_avx2::gemm_driver() {
+						let used = driver(
+							m,
+							n,
+							depth,
+							lhs.cast(),
+							lhs_cs as usize / 8,
+							rhs.cast(),
+							rhs_cs as usize / 8,
+							dst.cast(),
+							dst_cs as usize / 8,
+							*alpha.cast::<f64>(),
+							beta,
+							packed_lhs.as_mut_ptr().cast(),
+							core::mem::size_of_val(packed_lhs) / size_of::<f64>(),
+							packed_rhs.as_mut_ptr().cast(),
+							core::mem::size_of_val(packed_rhs) / size_of::<f64>(),
+							l1,
+							l2,
+						);
+						if used {
+							return;
+						}
 					}
 				},
 				DType::F32
