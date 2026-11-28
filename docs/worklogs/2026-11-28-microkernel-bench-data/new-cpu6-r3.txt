@@ -1,0 +1,63 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 6 (verified single CPU)
+core       : cpu6 (smt sibling 6,18), L3 8192K shared by 4-11,16-23, L2 1024K
+ran on cpu : 6 (sched_getcpu at start)
+commit     : new-pr26-3016c7e+overlay@8060521
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 1572864
+clock      : measured 1.981 GHz (dependent-add chain), used for peak 1.981 GHz
+peak/core  : 16 flop/cycle x 1.981 GHz = 31.70 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : true   stream tile: true
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+tile     packed FINISH(replace)             k=16                     51.7     29.73    93.8%
+tile     packed FINISH(replace)             k=64                    197.5     31.10    98.1%
+tile     packed FINISH(replace)             k=192                   586.6     31.42    99.1%
+tile     packed FINISH|ADD                  k=192                   586.9     31.41    99.1%
+tile     packed RESUME|FINISH|ADD           k=192                   587.5     31.38    99.0%
+tile     packed (no FINISH: spill sums)     k=192                   582.8     31.62    99.8%
+tile     stream full tile (B in place)      k=64 x1panel            195.5     31.42    99.1%
+tile     stream full tile (B in place)      k=192 x1panel           585.5     31.48    99.3%
+tile     stream full tile (B in place)      k=64 x4panel            778.9     31.55    99.5%
+edge     packed tile + edge copy            8x6 k=192               619.0     29.78    93.9%
+edge     packed tile + edge copy            7x6 k=192               600.7     26.85    84.7%
+edge     packed tile + edge copy            4x6 k=192               592.7     15.55    49.1%
+edge     packed tile + edge copy            2x6 k=192               594.1      7.76    24.5%
+edge     packed tile + edge copy            1x6 k=192               596.1      3.87    12.2%
+edge     packed tile + edge copy            8x3 k=192               597.6     15.42    48.6%
+edge     packed tile + edge copy            8x1 k=192               596.6      5.15    16.2%
+edge     packed tile + edge copy            2x3 k=192               587.5      3.92    12.4%
+edge     packed tile + edge copy            1x1 k=192               589.5      0.65     2.1%
+pack     pack_lhs                           80x192                 4340.6     56.62 GB/s
+pack     pack_lhs                           191x192               10690.2     54.89 GB/s
+pack     pack_lhs                           256x192               13391.9     58.72 GB/s
+pack     pack_rhs                           192x48                 2340.6     63.00 GB/s
+pack     pack_rhs_t                         192x48                 4117.7     35.81 GB/s
+pack     pack_rhs                           192x240               12475.1     59.10 GB/s
+pack     pack_rhs_t                         192x240               20665.8     35.68 GB/s
+pack     pack_rhs                           192x258               13980.9     56.69 GB/s
+pack     pack_rhs_t                         192x258               22221.9     35.67 GB/s
+driver   packed driver (multiply)           191x257x139          486119.2     28.07    88.6%
+driver   stream driver (stream_rhs)         191x257x139          490806.8     27.80    87.7%
+e2e      gemm Avx512 (host default)         191x257x139          441954.5     30.88    97.4%
+e2e      gemm Avx256 (forced)               191x257x139          457025.0     29.86    94.2%
+driver   packed driver (multiply)           192x257x139          493113.4     27.82    87.8%
+driver   stream driver (stream_rhs)         192x257x139          475426.8     28.85    91.0%
+e2e      gemm Avx512 (host default)         192x257x139          441288.2     31.09    98.1%
+e2e      gemm Avx256 (forced)               192x257x139          454392.6     30.19    95.2%
+driver   packed driver (multiply)           256x256x256         1148644.5     29.21    92.2%
+driver   stream driver (stream_rhs)         256x256x256         1167349.5     28.74    90.7%
+e2e      gemm Avx512 (host default)         256x256x256         1072998.5     31.27    98.7%
+e2e      gemm Avx256 (forced)               256x256x256         1105554.5     30.35    95.7%
+driver   packed driver (multiply)           511x511x511         8945923.0     29.83    94.1%
+driver   stream driver (stream_rhs)         511x511x511         9972135.0     26.76    84.4%
+e2e      gemm Avx512 (host default)         511x511x511         8567077.0     31.15    98.3%
+e2e      gemm Avx256 (forced)               511x511x511         8866706.0     30.10    94.9%
+driver   packed driver (multiply)           512x512x512         9024761.0     29.74    93.8%
+driver   stream driver (stream_rhs)         512x512x512         9990880.0     26.87    84.8%
+e2e      gemm Avx512 (host default)         512x512x512         8606922.0     31.19    98.4%
+e2e      gemm Avx256 (forced)               512x512x512         8906981.0     30.14    95.1%
+
+%peak = GFLOP/s / (16 flop/cycle x 1.981 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).
