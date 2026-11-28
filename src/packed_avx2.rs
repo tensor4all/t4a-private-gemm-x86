@@ -4,6 +4,8 @@ use core::arch::x86_64::{_mm256_mul_pd, _mm256_add_pd, _mm256_fmadd_pd, _mm256_l
 #[cfg(test)]
 use core::cell::Cell;
 
+mod stream_rhs;
+
 const MR: usize = 8;
 const NR: usize = 6;
 const ADD: usize = 1;
@@ -69,6 +71,28 @@ pub(super) fn cpu_admitted() -> bool {
 	})
 }
 
+type Driver = unsafe fn(
+	usize, usize, usize, *const f64, usize, *const f64, usize, *mut f64, usize,
+	f64, Accum, *mut f64, usize, *mut f64, usize, usize, usize,
+) -> bool;
+
+pub(super) fn gemm_driver() -> Option<Driver> {
+	if haswell() {
+		return Some(multiply);
+	}
+	#[cfg(test)]
+	if PROBE.with(|(force, _)| force.get() < 0) {
+		return None;
+	}
+	static RAPTOR_LAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	if !*RAPTOR_LAKE.get_or_init(|| cpu_model() == Some(0xB7) && std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+		return None;
+	}
+	// Core type is per logical CPU on a hybrid package. Both core types support
+	// this instruction set, but the streaming schedule was measured on the P-core.
+	(raw_cpuid::cpuid!(0x1a).eax >> 24 == 0x40).then_some(stream_rhs::multiply)
+}
+
 /// The work floor in units of L2 elements. Haswell keeps the floor measured in
 /// #9; the Skylake client family was measured at 128 on the i9-9900K.
 pub(super) fn floor_factor() -> usize {
@@ -98,7 +122,7 @@ pub(super) fn admitted_model(model: u8) -> bool {
 // Keep the lane grouping explicit so the compiler keeps all twelve sums in YMM registers.
 // SAFETY: the caller must enable AVX2 and FMA.
 #[inline(always)]
-unsafe fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
+unsafe fn step<const COLS: usize>(sums: &mut [[f64; MR]; COLS], a: &[f64; MR], b: &[f64; COLS]) {
 	let first = _mm256_loadu_pd(a.as_ptr());
 	let second = _mm256_loadu_pd(a.as_ptr().add(4));
 	for (col, &bj) in sums.iter_mut().zip(b) {
