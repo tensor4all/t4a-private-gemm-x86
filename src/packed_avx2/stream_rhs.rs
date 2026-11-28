@@ -2,6 +2,7 @@
 //! read B in place. While their twelve accumulators are live, spare load/store
 //! bandwidth packs A for subsequent tiles.
 use super::{Accum, DEPTH_BLOCK, MR, NR, add_rank_one, pack_lhs};
+use core::arch::x86_64::{__m256d, _mm256_add_pd, _mm256_broadcast_sd, _mm256_fmadd_pd, _mm256_loadu_pd, _mm256_setzero_pd, _mm256_storeu_pd};
 
 // Number of explicit depth steps in the full-tile loop below.
 const UNROLL: usize = 8;
@@ -213,7 +214,7 @@ unsafe fn joint_rows<const R: usize, const W: usize>(
 	let mut extra = [[0.0; W]; R];
 	for p in 0..depth {
 		let right: [f64; W] = core::array::from_fn(|j| *b.add(p + j * ldb));
-		super::step(&mut full, &*packed.add(p * MR).cast::<[f64; MR]>(), &right);
+		accumulate(&mut full, &*packed.add(p * MR).cast::<[f64; MR]>(), &right);
 		for (r, sums) in extra.iter_mut().enumerate() {
 			let l = *tail.add(p * R + r);
 			for (sum, &v) in sums.iter_mut().zip(&right) {
@@ -225,14 +226,12 @@ unsafe fn joint_rows<const R: usize, const W: usize>(
 		let dst = c.add(j * ldc);
 		if let Some((left, right)) = rank {
 			let v = *right.add(j * ldb);
-			for (i, &sum) in col.iter().enumerate() {
-				dst.add(i).write((*left.add(i)).mul_add(v, 0.0) + sum);
-			}
+			store_column_rank(dst, col, left, v);
 			for (r, row) in extra.iter().enumerate() {
 				dst.add(MR + r).write((*left.add(MR + r)).mul_add(v, 0.0) + row[j]);
 			}
 		} else {
-			core::ptr::copy_nonoverlapping(col.as_ptr(), dst, MR);
+			store_column(dst, col);
 			for (r, row) in extra.iter().enumerate() {
 				dst.add(MR + r).write(row[j]);
 			}
@@ -276,15 +275,59 @@ unsafe fn narrow_groups<const COLS: usize, const PANELS: usize>(
 			let right = core::array::from_fn(|j| *b.add(p + j * ldb));
 			for (t, panel) in sums.iter_mut().enumerate() {
 				let left = &*a.add((i + t * MR) * depth + p * MR).cast::<[f64; MR]>();
-				super::step(panel, left, &right);
+				accumulate(panel, left, &right);
 			}
 		}
 		for (t, panel) in sums.iter().enumerate() {
 			for (j, col) in panel.iter().enumerate() {
-				core::ptr::copy_nonoverlapping(col.as_ptr(), c.add(i + t * MR + j * ldc), MR);
+				store_column(c.add(i + t * MR + j * ldc), col);
 			}
 		}
 	}
+}
+
+/// Each output follows the same increasing-depth FMA chain: one fused `a * b + sum` per depth
+/// step. Written with explicit 256-bit intrinsics, not `f64::mul_add` over arrays, so the vector
+/// width does not depend on the crate's target features (the array form is vectorised by LLVM to
+/// whatever width the build allows, `zmm` under `-C target-cpu=znver5`). A column of `MR = 8`
+/// rows is two `__m256d` halves.
+///
+/// Callers are `#[target_feature(enable = "avx2,fma")]` functions this inlines into.
+#[inline(always)]
+fn accumulate<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
+	// SAFETY: all loads and stores are within the `[f64; 8]` columns and `left`; the callers
+	// run only after the dispatch tested AVX2 and FMA.
+	unsafe {
+		let first = _mm256_loadu_pd(left.as_ptr());
+		let second = _mm256_loadu_pd(left.as_ptr().add(4));
+		for (col, r) in sums.iter_mut().zip(right) {
+			let factor = _mm256_broadcast_sd(r);
+			let low = _mm256_fmadd_pd(first, factor, _mm256_loadu_pd(col.as_ptr()));
+			let high = _mm256_fmadd_pd(second, factor, _mm256_loadu_pd(col.as_ptr().add(4)));
+			_mm256_storeu_pd(col.as_mut_ptr(), low);
+			_mm256_storeu_pd(col.as_mut_ptr().add(4), high);
+		}
+	}
+}
+
+/// Store one 8-row column as two vector stores.
+#[inline(always)]
+unsafe fn store_column(dst: *mut f64, col: &[f64; MR]) {
+	_mm256_storeu_pd(dst, _mm256_loadu_pd(col.as_ptr()));
+	_mm256_storeu_pd(dst.add(4), _mm256_loadu_pd(col.as_ptr().add(4)));
+}
+
+/// Store `left * v + col`, the rank-one correction added to the column once: the product is a
+/// fused multiply with a zero addend (a single rounding of `left * v`), then added to the sums,
+/// exactly as `left[i].mul_add(v, 0.0) + col[i]` did.
+#[inline(always)]
+unsafe fn store_column_rank(dst: *mut f64, col: &[f64; MR], left: *const f64, v: f64) {
+	let factor = _mm256_broadcast_sd(&v);
+	let zero: __m256d = _mm256_setzero_pd();
+	let low = _mm256_add_pd(_mm256_fmadd_pd(_mm256_loadu_pd(left), factor, zero), _mm256_loadu_pd(col.as_ptr()));
+	let high = _mm256_add_pd(_mm256_fmadd_pd(_mm256_loadu_pd(left.add(4)), factor, zero), _mm256_loadu_pd(col.as_ptr().add(4)));
+	_mm256_storeu_pd(dst, low);
+	_mm256_storeu_pd(dst.add(4), high);
 }
 
 /// The hot loop is shared by all three packing modes. Slab mode copies
@@ -320,7 +363,7 @@ unsafe fn panels<const MODE: usize>(
 				let p = $index;
 				let left = &*a.add(p * MR).cast::<[f64; MR]>();
 				let right = core::array::from_fn(|j| *columns[j].add(p));
-				super::step(&mut cols, left, &right);
+				accumulate(&mut cols, left, &right);
 				if MODE == PACK_PANEL {
 					core::ptr::copy_nonoverlapping(src.add(p * lda), dst.add(p * MR), MR);
 				}
@@ -347,12 +390,11 @@ unsafe fn panels<const MODE: usize>(
 		if let Some((rank_a, right)) = &rank {
 			let left = &*rank_a.add(panel * MR).cast::<[f64; MR]>();
 			for (j, (col, &r)) in cols.iter().zip(right).enumerate() {
-				let updated: [f64; MR] = core::array::from_fn(|i| left[i].mul_add(r, 0.) + col[i]);
-				core::ptr::copy_nonoverlapping(updated.as_ptr(), c.add(j * ldc), MR);
+				store_column_rank(c.add(j * ldc), col, left.as_ptr(), r);
 			}
 		} else {
 			for (j, col) in cols.iter().enumerate() {
-				core::ptr::copy_nonoverlapping(col.as_ptr(), c.add(j * ldc), MR);
+				store_column(c.add(j * ldc), col);
 			}
 		}
 	}
@@ -361,6 +403,74 @@ unsafe fn panels<const MODE: usize>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The `mul_add`-over-arrays formulation the intrinsics replaced, kept as the reference.
+	fn accumulate_mul_add<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
+		for (col, &r) in sums.iter_mut().zip(right) {
+			for (sum, &l) in col.iter_mut().zip(left) {
+				*sum = l.mul_add(r, *sum);
+			}
+		}
+	}
+
+	fn xorshift(state: &mut u64) -> f64 {
+		*state ^= *state << 13;
+		*state ^= *state >> 7;
+		*state ^= *state << 17;
+		// Mix of magnitudes, signs and exact zeros; finite only.
+		let mantissa = (*state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+		let scale = [1.0, 1e-300, 1e300, 1e-8, 1e8, 0.0, 3.0][(*state % 7) as usize];
+		mantissa * scale
+	}
+
+	fn bit_identical_columns<const COLS: usize>() {
+		let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ COLS as u64;
+		for round in 0..40 {
+			let mut new = [[0.0; MR]; COLS];
+			let mut old = [[0.0; MR]; COLS];
+			for _ in 0..(1 + round * 17) {
+				let left: [f64; MR] = core::array::from_fn(|_| xorshift(&mut state));
+				let right: [f64; COLS] = core::array::from_fn(|_| xorshift(&mut state));
+				accumulate(&mut new, &left, &right);
+				accumulate_mul_add(&mut old, &left, &right);
+			}
+			for (a, b) in new.iter().flatten().zip(old.iter().flatten()) {
+				assert_eq!(a.to_bits(), b.to_bits(), "COLS={COLS} round {round}");
+			}
+			// Epilogues: plain column store and the rank-one correction.
+			let left: [f64; MR] = core::array::from_fn(|_| xorshift(&mut state));
+			let v = xorshift(&mut state);
+			for col in &new {
+				let mut dst = [f64::NAN; MR + 1];
+				unsafe { store_column(dst.as_mut_ptr(), col) };
+				assert!(dst[..MR].iter().zip(col).all(|(a, b)| a.to_bits() == b.to_bits()) && dst[MR].is_nan());
+				let mut dst = [f64::NAN; MR + 1];
+				unsafe { store_column_rank(dst.as_mut_ptr(), col, left.as_ptr(), v) };
+				for i in 0..MR {
+					let want = left[i].mul_add(v, 0.) + col[i];
+					assert_eq!(dst[i].to_bits(), want.to_bits(), "rank-one COLS={COLS} i={i}");
+				}
+				assert!(dst[MR].is_nan());
+			}
+		}
+	}
+
+	#[test]
+	fn intrinsic_accumulate_is_bit_identical_to_the_mul_add_chain() {
+		if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+			return;
+		}
+		#[target_feature(enable = "avx2,fma")]
+		unsafe fn all() {
+			bit_identical_columns::<1>();
+			bit_identical_columns::<2>();
+			bit_identical_columns::<3>();
+			bit_identical_columns::<4>();
+			bit_identical_columns::<5>();
+			bit_identical_columns::<6>();
+		}
+		unsafe { all() }
+	}
 
 	#[test]
 	fn streamed_tiles_match_the_arithmetic_groups_and_preserve_padding() {
