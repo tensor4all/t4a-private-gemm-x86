@@ -26,6 +26,14 @@ rayon = [
   "dep:crossbeam",
 ]
 
+# Exposes private kernels to `benches/microkernel.rs`. Off by default; never enable in a product.
+bench-internals = []
+
+[[bench]]
+name = "microkernel"
+harness = false
+required-features = ["bench-internals"]
+
 [dependencies]
 raw-cpuid = "11.5.0"
 crossbeam = { version = "0.8.4", optional = true }

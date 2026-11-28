@@ -28,6 +28,68 @@ pub struct Position {
 
 mod cache;
 mod packed_avx2;
+/// Benchmark-only access to private kernels (`--features bench-internals`). Not part of the API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_internals {
+	pub use crate::packed_avx2::bench::*;
+
+	/// True when the AVX-512 f64 asm microkernels can run on this CPU.
+	pub fn avx512_available() -> bool {
+		std::arch::is_x86_feature_detected!("avx512f")
+	}
+
+	/// One AVX-512 f64 tile as `gemm_impl` calls it (single `millikernel_colmajor` call, no packing):
+	/// `wide = false` is the 48 x 4 kernel, `true` the 24 x 8 kernel `gemm_impl` uses when `nrows <= 48`.
+	/// `lhs` is column-major with leading dimension `mr`, `rhs` column-major with leading dimension
+	/// `depth`, `dst` column-major with leading dimension `mr`. `m <= mr` and `n <= nr` give the fringe.
+	/// `accumulate` adds into `dst` instead of replacing it.
+	///
+	/// # Safety
+	/// AVX-512F must be available; the buffers must hold `mr*depth`, `depth*nr` and `mr*nr` f64.
+	pub unsafe fn avx512_tile(wide: bool, m: usize, n: usize, depth: usize, lhs: *const f64, rhs: *const f64, dst: *mut f64, accumulate: bool) {
+		let (mk, mr, nr) = if wide { (crate::F64_SIMD512x8[7], 24usize, 8usize) } else { (crate::F64_SIMD512x4[3], 48, 4) };
+		let sizeof = 8isize;
+		let alpha = 1.0f64;
+		let mut pos = crate::Position { row: 0, col: 0 };
+		crate::millikernel_colmajor(
+			mk,
+			crate::F64_SIMDpack_512[0],
+			mr,
+			nr,
+			8,
+			lhs.cast(),
+			lhs.cast_mut().cast(),
+			rhs.cast(),
+			rhs.cast_mut().cast(),
+			m,
+			n,
+			&mut crate::MillikernelInfo {
+				lhs_rs: mr as isize * sizeof,
+				packed_lhs_rs: mr as isize * sizeof,
+				rhs_cs: nr as isize * sizeof * depth as isize,
+				packed_rhs_cs: nr as isize * sizeof * depth as isize,
+				micro: crate::MicrokernelInfo {
+					flags: if accumulate { crate::FLAGS_ACCUM } else { 0 },
+					depth,
+					lhs_rs: sizeof,
+					lhs_cs: mr as isize * sizeof,
+					rhs_rs: sizeof,
+					rhs_cs: depth as isize * sizeof,
+					alpha: (&raw const alpha).cast(),
+					ptr: dst.cast(),
+					rs: sizeof,
+					cs: mr as isize * sizeof,
+					row_idx: core::ptr::null(),
+					col_idx: core::ptr::null(),
+					diag_ptr: core::ptr::null(),
+					diag_stride: 0,
+				},
+			},
+			&mut pos,
+		)
+	}
+}
 mod packed_avx2_f32;
 
 /// Runs the process-wide cache probe now instead of inside the first product (faer#232).

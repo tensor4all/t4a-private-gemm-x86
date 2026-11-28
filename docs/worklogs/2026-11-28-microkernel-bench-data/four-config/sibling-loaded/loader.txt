@@ -1,0 +1,6 @@
+r0 cpu2 loader pid 1893022 on cpu  14
+r0 cpu6 loader pid 1893531 on cpu  18
+r1 cpu2 loader pid 1893990 on cpu  14
+r1 cpu6 loader pid 1894688 on cpu  18
+r2 cpu2 loader pid 1895259 on cpu  14
+r2 cpu6 loader pid 1895672 on cpu  18

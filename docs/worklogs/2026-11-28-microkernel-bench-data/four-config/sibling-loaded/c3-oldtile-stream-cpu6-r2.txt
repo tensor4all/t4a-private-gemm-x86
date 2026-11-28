@@ -1,0 +1,32 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 6 (verified single CPU)
+core       : cpu6 (smt sibling 6,18), L3 8192K shared by 4-11,16-23, L2 1024K
+ran on cpu : 6 (sched_getcpu at start)
+commit     : c3-oldtile-stream+sibling-loaded
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 1572864
+clock      : measured 1.726 GHz (dependent-add chain), used for peak 1.726 GHz
+peak/core  : 16 flop/cycle x 1.726 GHz = 27.62 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : true   stream tile: true
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+driver   packed driver (multiply)           191x257x139          509819.8     26.77    96.9%
+driver   stream driver (stream_rhs)         191x257x139          468541.6     29.12   105.5%
+driver   packed driver (multiply)           192x257x139          506849.2     27.06    98.0%
+driver   stream driver (stream_rhs)         192x257x139          465865.4     29.45   106.6%
+driver   packed driver (multiply)           256x256x256         1201393.5     27.93   101.1%
+driver   stream driver (stream_rhs)         256x256x256         1129945.0     29.70   107.5%
+driver   packed driver (multiply)           511x511x511         9375337.0     28.46   103.1%
+driver   stream driver (stream_rhs)         511x511x511         8982304.0     29.71   107.6%
+driver   packed driver (multiply)           512x512x512         9438123.0     28.44   103.0%
+driver   stream driver (stream_rhs)         512x512x512         9243952.0     29.04   105.2%
+driver   packed driver (multiply)           256x32x256           155959.3     26.89    97.4%
+driver   stream driver (stream_rhs)         256x32x256           142677.1     29.40   106.4%
+driver   packed driver (multiply)           256x512x256         2356310.0     28.48   103.1%
+driver   stream driver (stream_rhs)         256x512x256         2245082.0     29.89   108.2%
+driver   packed driver (multiply)           256x513x256         2373061.0     28.33   102.6%
+driver   stream driver (stream_rhs)         256x513x256         2263897.0     29.70   107.5%
+
+%peak = GFLOP/s / (16 flop/cycle x 1.726 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).

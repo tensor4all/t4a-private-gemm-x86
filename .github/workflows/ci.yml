@@ -14,6 +14,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --profile ci --all-targets
+      - name: Microkernel benchmark compiles; fringe rows round like full tiles (#27)
+        # Compile-only for the benchmark (it is never run in CI). The bench target needs the
+        # non-default `bench-internals` feature, so `--all-targets` above skips it.
+        run: |
+          cargo build --profile ci --features bench-internals --benches
+          cargo test --release --features bench-internals --test fringe_bits -- --nocapture
       - name: Triangular destinations, both instruction sets
         # The test names `InstrSet` explicitly, so an AVX-512 runner covers the 256-bit path
         # (the one that used to write below the diagonal) and an AVX2-only runner covers it

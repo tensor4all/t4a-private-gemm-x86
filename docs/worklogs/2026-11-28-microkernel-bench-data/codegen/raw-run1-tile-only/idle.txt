@@ -1,0 +1,96 @@
+pre r1 cpu2 default B0: sibling busy 0%
+post r1 cpu2 default B0: sibling busy over run 0%
+pre r1 cpu2 default B1: sibling busy 0%
+post r1 cpu2 default B1: sibling busy over run 0%
+pre r1 cpu2 x86-64-v3 B0: sibling busy 0%
+post r1 cpu2 x86-64-v3 B0: sibling busy over run 0%
+pre r1 cpu2 x86-64-v3 B1: sibling busy 0%
+post r1 cpu2 x86-64-v3 B1: sibling busy over run 0%
+pre r1 cpu2 znver5 B0: sibling busy 1%
+post r1 cpu2 znver5 B0: sibling busy over run 0%
+pre r1 cpu2 znver5 B1: sibling busy 0%
+post r1 cpu2 znver5 B1: sibling busy over run 0%
+pre r1 cpu2 raptorlake B0: sibling busy 0%
+post r1 cpu2 raptorlake B0: sibling busy over run 0%
+pre r1 cpu2 raptorlake B1: sibling busy 0%
+post r1 cpu2 raptorlake B1: sibling busy over run 0%
+pre r1 cpu6 default B0: sibling busy 0%
+post r1 cpu6 default B0: sibling busy over run 0%
+pre r1 cpu6 default B1: sibling busy 0%
+post r1 cpu6 default B1: sibling busy over run 0%
+pre r1 cpu6 x86-64-v3 B0: sibling busy 0%
+post r1 cpu6 x86-64-v3 B0: sibling busy over run 0%
+pre r1 cpu6 x86-64-v3 B1: sibling busy 0%
+post r1 cpu6 x86-64-v3 B1: sibling busy over run 0%
+pre r1 cpu6 znver5 B0: sibling busy 0%
+post r1 cpu6 znver5 B0: sibling busy over run 0%
+pre r1 cpu6 znver5 B1: sibling busy 0%
+post r1 cpu6 znver5 B1: sibling busy over run 0%
+pre r1 cpu6 raptorlake B0: sibling busy 0%
+post r1 cpu6 raptorlake B0: sibling busy over run 0%
+pre r1 cpu6 raptorlake B1: sibling busy 0%
+post r1 cpu6 raptorlake B1: sibling busy over run 0%
+pre r2 cpu6 default B1: sibling busy 0%
+post r2 cpu6 default B1: sibling busy over run 0%
+pre r2 cpu6 default B0: sibling busy 0%
+post r2 cpu6 default B0: sibling busy over run 0%
+pre r2 cpu6 x86-64-v3 B1: sibling busy 1%
+post r2 cpu6 x86-64-v3 B1: sibling busy over run 0%
+pre r2 cpu6 x86-64-v3 B0: sibling busy 0%
+post r2 cpu6 x86-64-v3 B0: sibling busy over run 0%
+pre r2 cpu6 znver5 B1: sibling busy 0%
+post r2 cpu6 znver5 B1: sibling busy over run 0%
+pre r2 cpu6 znver5 B0: sibling busy 0%
+post r2 cpu6 znver5 B0: sibling busy over run 0%
+pre r2 cpu6 raptorlake B1: sibling busy 0%
+post r2 cpu6 raptorlake B1: sibling busy over run 0%
+pre r2 cpu6 raptorlake B0: sibling busy 0%
+post r2 cpu6 raptorlake B0: sibling busy over run 0%
+pre r2 cpu2 default B1: sibling busy 0%
+post r2 cpu2 default B1: sibling busy over run 0%
+pre r2 cpu2 default B0: sibling busy 1%
+post r2 cpu2 default B0: sibling busy over run 0%
+pre r2 cpu2 x86-64-v3 B1: sibling busy 2%
+post r2 cpu2 x86-64-v3 B1: sibling busy over run 0%
+pre r2 cpu2 x86-64-v3 B0: sibling busy 0%
+post r2 cpu2 x86-64-v3 B0: sibling busy over run 0%
+pre r2 cpu2 znver5 B1: sibling busy 0%
+post r2 cpu2 znver5 B1: sibling busy over run 0%
+pre r2 cpu2 znver5 B0: sibling busy 0%
+post r2 cpu2 znver5 B0: sibling busy over run 0%
+pre r2 cpu2 raptorlake B1: sibling busy 0%
+post r2 cpu2 raptorlake B1: sibling busy over run 0%
+pre r2 cpu2 raptorlake B0: sibling busy 0%
+post r2 cpu2 raptorlake B0: sibling busy over run 0%
+pre r3 cpu2 default B0: sibling busy 0%
+post r3 cpu2 default B0: sibling busy over run 0%
+pre r3 cpu2 default B1: sibling busy 0%
+post r3 cpu2 default B1: sibling busy over run 0%
+pre r3 cpu2 x86-64-v3 B0: sibling busy 0%
+post r3 cpu2 x86-64-v3 B0: sibling busy over run 0%
+pre r3 cpu2 x86-64-v3 B1: sibling busy 0%
+post r3 cpu2 x86-64-v3 B1: sibling busy over run 0%
+pre r3 cpu2 znver5 B0: sibling busy 0%
+post r3 cpu2 znver5 B0: sibling busy over run 0%
+pre r3 cpu2 znver5 B1: sibling busy 1%
+post r3 cpu2 znver5 B1: sibling busy over run 0%
+pre r3 cpu2 raptorlake B0: sibling busy 0%
+post r3 cpu2 raptorlake B0: sibling busy over run 0%
+pre r3 cpu2 raptorlake B1: sibling busy 0%
+post r3 cpu2 raptorlake B1: sibling busy over run 0%
+pre r3 cpu6 default B0: sibling busy 0%
+post r3 cpu6 default B0: sibling busy over run 0%
+pre r3 cpu6 default B1: sibling busy 0%
+post r3 cpu6 default B1: sibling busy over run 0%
+pre r3 cpu6 x86-64-v3 B0: sibling busy 1%
+post r3 cpu6 x86-64-v3 B0: sibling busy over run 0%
+pre r3 cpu6 x86-64-v3 B1: sibling busy 0%
+post r3 cpu6 x86-64-v3 B1: sibling busy over run 0%
+pre r3 cpu6 znver5 B0: sibling busy 0%
+post r3 cpu6 znver5 B0: sibling busy over run 0%
+pre r3 cpu6 znver5 B1: sibling busy 0%
+post r3 cpu6 znver5 B1: sibling busy over run 0%
+pre r3 cpu6 raptorlake B0: sibling busy 0%
+post r3 cpu6 raptorlake B0: sibling busy over run 0%
+pre r3 cpu6 raptorlake B1: sibling busy 0%
+post r3 cpu6 raptorlake B1: sibling busy over run 0%

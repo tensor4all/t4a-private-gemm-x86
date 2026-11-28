@@ -1,0 +1,34 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 6 (verified single CPU)
+core       : cpu6 (smt sibling 6,18), L3 8192K shared by 4-11,16-23, L2 1024K
+ran on cpu : 6 (sched_getcpu at start)
+commit     : c1-old-old
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 1572864
+clock      : measured 1.994 GHz (dependent-add chain), used for peak 1.994 GHz
+peak/core  : 16 flop/cycle x 1.994 GHz = 31.91 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : false   stream tile: false
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+tile     packed FINISH(replace)             k=16                     51.4     29.90    93.7%
+tile     packed FINISH(replace)             k=64                    196.8     31.22    97.9%
+tile     packed FINISH(replace)             k=192                   602.1     30.61    95.9%
+tile     packed FINISH|ADD                  k=192                   602.6     30.59    95.9%
+tile     packed RESUME|FINISH|ADD           k=192                   601.6     30.64    96.0%
+tile     packed (no FINISH: spill sums)     k=192                   581.4     31.70    99.4%
+driver   packed driver (multiply)           191x257x139          485729.8     28.09    88.1%
+driver   packed driver (multiply)           192x257x139          493362.6     27.80    87.1%
+driver   packed driver (multiply)           256x256x256         1152892.5     29.10    91.2%
+driver   packed driver (multiply)           511x511x511         8972353.0     29.74    93.2%
+driver   packed driver (multiply)           512x512x512         9045358.0     29.68    93.0%
+driver   packed driver (multiply)           256x32x256           144258.1     29.08    91.1%
+driver   packed driver (multiply)           256x512x256         2304082.0     29.13    91.3%
+driver   packed driver (multiply)           256x513x256         2321063.0     28.97    90.8%
+
+scratch  driver                             shape            pa_written_KiB pb_written_KiB  rss_delta_KiB
+scratch  packed driver (multiply)           191x257x139                 383            279             32
+scratch  packed driver (multiply)           512x512x512                2552           1145            -44
+
+%peak = GFLOP/s / (16 flop/cycle x 1.994 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).

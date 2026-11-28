@@ -1,0 +1,708 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e22ee45..e6cc5de 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,6 +26,16 @@ rayon = [
+   "dep:crossbeam",
+ ]
+ 
++# Exposes private kernels to `benches/microkernel.rs`. Off by default; never enable in a product.
++bench-internals = []
++exp-newtile = []
++exp-oldtile = []
++
++[[bench]]
++name = "microkernel"
++harness = false
++required-features = ["bench-internals"]
++
+ [dependencies]
+ raw-cpuid = "11.5.0"
+ crossbeam = { version = "0.8.4", optional = true }
+diff --git a/benches/microkernel.rs b/benches/microkernel.rs
+new file mode 100644
+index 0000000..65b6648
+--- /dev/null
++++ b/benches/microkernel.rs
+@@ -0,0 +1,369 @@
++//! Microkernel, packing, driver and end-to-end benchmark for the AVX2 f64 GEMM tiles (#27).
++//!
++//! Run (one pinned core, nothing else on its SMT sibling):
++//!
++//! ```text
++//! BENCH_COMMIT=$(git rev-parse --short HEAD) \
++//!   taskset -c 2 cargo bench --features bench-internals --bench microkernel
++//! ```
++//!
++//! Method: every row is a median over `SAMPLES` samples; one sample times `iters` back-to-back
++//! calls, with `iters` calibrated so a sample lasts at least `MIN_SAMPLE`. Pack buffers, inputs
++//! and drivers' scratch are allocated and touched before timing; only the named call is timed.
++//!
++//! Peak: `FLOPS_PER_CYCLE = 2 FMA units x 4 doubles x 2 flops = 16` per core (documented AVX2
++//! FMA throughput of Haswell..Raptor Lake P-core and Zen 4/5). The denominator uses the clock
++//! in `BENCH_GHZ` when set; otherwise the clock measured here by a dependent-add chain
++//! (one add per cycle). The clock actually used is printed. No fraction is printed without one.
++use private_gemm_x86::bench_internals as k;
++use private_gemm_x86::{Accum, DType, DstKind, IType, InstrSet};
++use std::hint::black_box;
++use std::time::{Duration, Instant};
++
++const SAMPLES: usize = 31;
++const MIN_SAMPLE: Duration = Duration::from_millis(2);
++const FLOPS_PER_CYCLE: f64 = 16.0;
++
++struct Ctx {
++	ghz: f64,
++	rows: Vec<String>,
++}
++
++/// Median ns per call of `f`.
++fn time<F: FnMut()>(mut f: F) -> f64 {
++	// warm-up: fill caches, reach steady frequency
++	let t0 = Instant::now();
++	while t0.elapsed() < Duration::from_millis(100) {
++		f();
++	}
++	let mut iters = 1usize;
++	loop {
++		let t = Instant::now();
++		for _ in 0..iters {
++			f();
++		}
++		if t.elapsed() >= MIN_SAMPLE {
++			break;
++		}
++		iters *= 2;
++	}
++	let mut v: Vec<f64> = (0..SAMPLES)
++		.map(|_| {
++			let t = Instant::now();
++			for _ in 0..iters {
++				f();
++			}
++			t.elapsed().as_secs_f64() * 1e9 / iters as f64
++		})
++		.collect();
++	v.sort_by(|a, b| a.partial_cmp(b).unwrap());
++	v[SAMPLES / 2]
++}
++
++impl Ctx {
++	fn row(&mut self, group: &str, name: &str, shape: &str, ns: f64, flops: f64) {
++		let gf = flops / ns;
++		let pct = gf / (self.ghz * FLOPS_PER_CYCLE) * 100.0;
++		let line = format!("{group:<8} {name:<34} {shape:<16} {ns:>12.1} {gf:>9.2} {pct:>7.1}%");
++		println!("{line}");
++		self.rows.push(line);
++	}
++	fn bytes(&mut self, group: &str, name: &str, shape: &str, ns: f64, bytes: f64) {
++		println!("{group:<8} {name:<34} {shape:<16} {ns:>12.1} {:>9.2} GB/s", bytes / ns);
++	}
++}
++
++fn rng(seed: &mut u64) -> f64 {
++	*seed ^= *seed << 13;
++	*seed ^= *seed >> 7;
++	*seed ^= *seed << 17;
++	(*seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
++}
++
++fn vec(n: usize, seed: &mut u64) -> Vec<f64> {
++	(0..n).map(|_| rng(seed)).collect()
++}
++
++/// Cycles-per-second of this core from a dependent integer-add chain (latency 1).
++fn calibrate_ghz() -> f64 {
++	fn chain(n: u64) -> u64 {
++		let mut x = 0u64;
++		for _ in 0..n / 8 {
++			unsafe {
++				core::arch::asm!(
++					"add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1",
++					"add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1",
++					x = inout(reg) x, options(nomem, nostack)
++				);
++			}
++		}
++		x
++	}
++	let n = 400_000_000u64;
++	black_box(chain(n / 10));
++	let mut best = f64::MAX;
++	for _ in 0..5 {
++		let t = Instant::now();
++		black_box(chain(black_box(n)));
++		best = best.min(t.elapsed().as_secs_f64());
++	}
++	n as f64 / best / 1e9
++}
++
++fn cpu_name() -> String {
++	raw_cpuid::CpuId::new()
++		.get_processor_brand_string()
++		.map(|b| b.as_str().trim().to_string())
++		.unwrap_or_else(|| "unknown".into())
++}
++
++fn sh(cmd: &str) -> String {
++	std::process::Command::new("sh")
++		.args(["-c", cmd])
++		.output()
++		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
++		.unwrap_or_default()
++}
++
++extern "C" {
++	fn sched_getcpu() -> i32;
++}
++
++fn main() {
++	if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
++		println!("SKIP: no AVX2+FMA");
++		return;
++	}
++	// `cargo bench` passes `--bench`; a bare filter argument selects groups by prefix.
++	let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
++	let want = |g: &str| filter.is_empty() || filter.iter().any(|f| g.starts_with(f.as_str()));
++
++	// Verify the pin instead of trusting it: exactly one allowed CPU, and record what the kernel
++	// says about that CPU (L3 size and sharing group distinguish Zen 5 from Zen 5c).
++	let allowed = sh("grep Cpus_allowed_list /proc/self/status | cut -f2");
++	let cpu: usize = match allowed.parse() {
++		Ok(c) => c,
++		Err(_) => {
++			eprintln!("REFUSING TO RUN: affinity is '{allowed}', not a single CPU. Use taskset -c <cpu>.");
++			std::process::exit(2);
++		}
++	};
++	let sys = |f: &str| sh(&format!("cat /sys/devices/system/cpu/cpu{cpu}/{f} 2>/dev/null"));
++	let core_line = format!(
++		"cpu{cpu} (smt sibling {}), L3 {} shared by {}, L2 {}",
++		sys("topology/thread_siblings_list"), sys("cache/index3/size"), sys("cache/index3/shared_cpu_list"), sys("cache/index2/size")
++	);
++	let measured = calibrate_ghz();
++	let ghz = std::env::var("BENCH_GHZ").ok().and_then(|s| s.parse().ok()).unwrap_or(measured);
++	let (l1, l2, l3) = k::cache_elems();
++	println!("host       : {}", sh("hostname"));
++	println!("cpu        : {}", cpu_name());
++	println!("affinity   : {allowed} (verified single CPU)");
++	println!("core       : {core_line}");
++	println!("ran on cpu : {} (sched_getcpu at start)", unsafe { sched_getcpu() });
++	println!("commit     : {}", std::env::var("BENCH_COMMIT").unwrap_or_else(|_| "unrecorded".into()));
++	println!("boost      : {} (1 = turbo/boost on)", sh("cat /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null | tr '\\n' ' '"));
++	println!("cache f64s : L1d {l1}  L2 {l2}  L3 {l3}");
++	println!("clock      : measured {measured:.3} GHz (dependent-add chain), used for peak {ghz:.3} GHz");
++	println!("peak/core  : {FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz = {:.2} GFLOP/s", FLOPS_PER_CYCLE * ghz);
++	println!("method     : median of {SAMPLES} samples, each >= {MIN_SAMPLE:?} of back-to-back calls, 100 ms warm-up");
++	println!("stream drv : {}   stream tile: {}", k::stream_driver().is_some(), k::stream_tile().is_some());
++	println!();
++	println!("{:<8} {:<34} {:<16} {:>12} {:>9} {:>8}", "group", "kernel", "shape", "ns/call", "GFLOP/s", "%peak");
++	let mut c = Ctx { ghz, rows: vec![] };
++	let mut seed = 0x9E3779B97F4A7C15u64;
++	let (mr, nr) = (k::TILE_MR, k::TILE_NR);
++
++	if want("tile") {
++		// Packed tile, L1-resident: A is k*8, B is k*6, all packed.
++		for depth in [16usize, 64, 192, 512] {
++			let a = vec(depth * mr, &mut seed);
++			let b = vec(depth * nr, &mut seed);
++			let mut out = vec![0.0; mr * nr];
++			let mut partial = vec![0.0; mr * nr];
++			let flops = (2 * mr * nr * depth) as f64;
++			let ns = time(|| unsafe {
++				k::tile_packed(black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), 8 * mr, depth, 1.0, partial.as_mut_ptr(), k::F_FINISH);
++				black_box(&mut out);
++			});
++			c.row("tile", "packed FINISH(replace)", &format!("k={depth}"), ns, flops);
++		}
++		let depth = 192usize;
++		let a = vec(depth * mr, &mut seed);
++		let b = vec(depth * nr, &mut seed);
++		let mut out = vec![0.5; mr * nr];
++		let mut partial = vec![0.25; mr * nr];
++		let flops = (2 * mr * nr * depth) as f64;
++		for (name, flags) in [
++			("packed FINISH|ADD", k::F_FINISH | k::F_ADD),
++			("packed RESUME|FINISH|ADD", k::F_RESUME | k::F_FINISH | k::F_ADD),
++			("packed (no FINISH: spill sums)", 0),
++		] {
++			let ns = time(|| unsafe {
++				k::tile_packed(black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), 8 * mr, depth, 1.0, partial.as_mut_ptr(), flags);
++				black_box(&mut out);
++			});
++			c.row("tile", name, &format!("k={depth}"), ns, flops);
++		}
++		// Streamed tile (only in trees that have it): A packed, B column-major in place.
++		if let Some(st) = k::stream_tile() {
++			for (depth, panels) in [(64usize, 1usize), (192, 1), (64, 4), (511, 1), (512, 1), (513, 1), (512, 4)] {
++				let a = vec(depth * mr * panels, &mut seed);
++				let ldb = depth;
++				let b = vec(depth * nr, &mut seed);
++				let mut out = vec![0.0; mr * panels * nr];
++				let flops = (2 * mr * nr * depth * panels) as f64;
++				let ns = time(|| unsafe {
++					st(depth, black_box(a.as_ptr()), black_box(b.as_ptr()), ldb, out.as_mut_ptr(), mr * panels, panels);
++					black_box(&mut out);
++				});
++				c.row("tile", "stream full tile (B in place)", &format!("k={depth} x{panels}panel"), ns, flops);
++			}
++		}
++	}
++
++	if want("tile") && k::stream_tile().is_some() {
++		// EXPERIMENT (local overlay): the streamed tile in the driver's three modes. A source is column-major, lda = 512.
++		let lda = 512usize;
++		let src = vec(lda * 520, &mut seed);
++		for (depth, panels) in [(192usize, 1usize), (512, 1), (512, 4)] {
++			let a = vec(depth * mr * panels, &mut seed);
++			let b = vec(depth * nr, &mut seed);
++			let mut out = vec![0.0; mr * panels * nr];
++			let mut dst = vec![0.0; depth * mr * panels];
++			let flops = (2 * mr * nr * depth * panels) as f64;
++			for (mode, name) in [(0usize, "stream mode COMPUTE"), (1, "stream mode PACK_PANEL"), (2, "stream mode PACK_SLAB")] {
++				let ns = time(|| unsafe {
++					k::stream_tile_mode(mode, depth, black_box(a.as_ptr()), black_box(b.as_ptr()), depth, out.as_mut_ptr(), mr * panels, panels, black_box(src.as_ptr()), lda, dst.as_mut_ptr());
++					black_box(&mut out);
++				});
++				c.row("tile", name, &format!("k={depth} x{panels}panel"), ns, flops);
++			}
++		}
++	}
++
++	if want("edge") {
++		// Fringe cost against a full tile at the same depth (packed tile into an edge buffer + copy).
++		let depth = 192usize;
++		let a = vec(depth * mr, &mut seed);
++		let b = vec(depth * nr, &mut seed);
++		let mut out = vec![0.0; mr * nr];
++		for (h, w) in [(8usize, 6usize), (7, 6), (4, 6), (2, 6), (1, 6), (8, 3), (8, 1), (2, 3), (1, 1)] {
++			let flops = (2 * h * w * depth) as f64; // useful flops only
++			let ns = time(|| unsafe {
++				k::tile_edge(black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), mr, h, w, depth, false);
++				black_box(&mut out);
++			});
++			c.row("edge", "packed tile + edge copy", &format!("{h}x{w} k={depth}"), ns, flops);
++		}
++	}
++
++	if want("pack") {
++		// Typical panels: mc x kc left block, kc x nc right block (Haswell-like blocking) and a fringe row count.
++		let kc = 192usize;
++		let lda = 1032usize;
++		let src = vec(lda * (kc + 260), &mut seed); // pack_rhs_t strides j by ldb: needs (cols + kc) rows
++		let mut dst = vec![0.0; 256 * kc.max(240)];
++		for rows in [80usize, 191, 256] {
++			let ns = time(|| unsafe {
++				k::pack_lhs_f64(black_box(src.as_ptr()), lda, dst.as_mut_ptr(), rows, kc);
++				black_box(&mut dst);
++			});
++			c.bytes("pack", "pack_lhs", &format!("{rows}x{kc}"), ns, (rows * kc * 16) as f64);
++		}
++		for cols in [48usize, 240, 258] {
++			let ns = time(|| unsafe {
++				k::pack_rhs_f64(black_box(src.as_ptr()), lda, dst.as_mut_ptr(), cols, kc);
++				black_box(&mut dst);
++			});
++			c.bytes("pack", "pack_rhs", &format!("{kc}x{cols}"), ns, (cols * kc * 16) as f64);
++			let ns = time(|| unsafe {
++				k::pack_rhs_t_f64(black_box(src.as_ptr()), lda, dst.as_mut_ptr(), cols, kc);
++				black_box(&mut dst);
++			});
++			c.bytes("pack", "pack_rhs_t", &format!("{kc}x{cols}"), ns, (cols * kc * 16) as f64);
++		}
++	}
++
++	// Driver-only: the whole driver (pack + traversal + tiles) with scratch preallocated, no public dispatch.
++	// End-to-end: the public `gemm` (dispatch included), default instruction set and forced AVX2.
++	let shapes: &[(usize, usize, usize)] = &[(191, 257, 139), (192, 257, 139), (256, 256, 256), (511, 511, 511), (512, 512, 512), (256, 32, 256), (256, 512, 256), (256, 513, 256)];
++	let pa_len = l3.next_multiple_of(16);
++	let pb_len = l3.next_multiple_of(nr);
++	let mut pa = vec![0.0f64; pa_len];
++	let mut pb = vec![0.0f64; pb_len];
++	for &(m, kk, n) in shapes {
++		let a = vec(m * kk, &mut seed);
++		let b = vec(kk * n, &mut seed);
++		let mut out = vec![0.0; m * n];
++		let flops = (2 * m * n * kk) as f64;
++		let shape = format!("{m}x{kk}x{n}");
++		if want("driver") {
++			let drivers: Vec<(&str, k::Driver)> = std::iter::once(("packed driver (multiply)", k::packed_driver()))
++				.chain(k::stream_driver().map(|d| ("stream driver (stream_rhs)", d)))
++				.collect();
++			for (name, d) in drivers {
++				// Refusal is a result too: report it instead of timing a no-op.
++				let ok = unsafe { d(m, n, kk, a.as_ptr(), m, b.as_ptr(), kk, out.as_mut_ptr(), m, 1.0, Accum::Replace, pa.as_mut_ptr(), pa_len, pb.as_mut_ptr(), pb_len, l1, l2) };
++				if !ok {
++					println!("{:<8} {name:<34} {shape:<16} refused", "driver");
++					continue;
++				}
++				let ns = time(|| unsafe {
++					black_box(d(m, n, kk, black_box(a.as_ptr()), m, black_box(b.as_ptr()), kk, out.as_mut_ptr(), m, 1.0, Accum::Replace, pa.as_mut_ptr(), pa_len, pb.as_mut_ptr(), pb_len, l1, l2));
++					black_box(&mut out);
++				});
++				c.row("driver", name, &shape, ns, flops);
++			}
++		}
++		if want("e2e") {
++			let mut instrs = vec![("gemm Avx256 (forced)", InstrSet::Avx256)];
++			if is_x86_feature_detected!("avx512f") {
++				instrs.insert(0, ("gemm Avx512 (host default)", InstrSet::Avx512));
++			}
++			for (name, instr) in instrs {
++				let alpha = 1.0f64;
++				let ns = time(|| unsafe {
++					private_gemm_x86::gemm(
++						DType::F64, IType::U64, instr, m, n, kk,
++						out.as_mut_ptr().cast(), 1, m as isize, core::ptr::null(), core::ptr::null(), DstKind::Full,
++						Accum::Replace,
++						black_box(a.as_ptr()).cast(), 1, m as isize, false,
++						core::ptr::null(), 0,
++						black_box(b.as_ptr()).cast(), 1, kk as isize, false,
++						(&alpha as *const f64).cast(), 1,
++					);
++					black_box(&mut out);
++				});
++				// peak for Avx512 would double; report against the AVX2 denominator and say so.
++				c.row("e2e", name, &shape, ns, flops);
++			}
++		}
++	}
++	if want("scratch") {
++		// Which scratch does each driver write? Buffers are calloc'd and untouched, so RSS growth
++		// counts only pages the call writes. `pa` holds packed A, `pb` packed B (or the dense tail rows).
++		println!();
++		println!("scratch  driver                             shape            pa_written_KiB pb_written_KiB  rss_delta_KiB");
++		for &(m, kk, n) in &[(191usize, 257usize, 139usize), (512, 512, 512)] {
++			let a = vec(m * kk, &mut seed);
++			let b = vec(kk * n, &mut seed);
++			let drivers: Vec<(&str, k::Driver)> = std::iter::once(("packed driver (multiply)", k::packed_driver()))
++				.chain(k::stream_driver().map(|d| ("stream driver (stream_rhs)", d)))
++				.collect();
++			for (name, d) in drivers {
++				let mut out = vec![f64::NAN; m * n];
++				let mut spa = vec![0.0f64; pa_len];
++				let mut spb = vec![0.0f64; pb_len];
++				let rss = || -> i64 { sh("awk '/^VmRSS/{print $2}' /proc/self/status").parse().unwrap_or(-1) };
++				let r0 = rss();
++				let ok = unsafe { d(m, n, kk, a.as_ptr(), m, b.as_ptr(), kk, out.as_mut_ptr(), m, 1.0, Accum::Replace, spa.as_mut_ptr(), pa_len, spb.as_mut_ptr(), pb_len, l1, l2) };
++				let r1 = rss();
++				let w = |v: &[f64]| v.iter().filter(|x| **x != 0.0).count() * 8 / 1024;
++				println!("scratch  {name:<34} {:<16} {:>14} {:>14} {:>14}{}", format!("{m}x{kk}x{n}"), w(&spa), w(&spb), r1 - r0, if ok { "" } else { "  (refused)" });
++			}
++		}
++	}
++	println!();
++	println!("%peak = GFLOP/s / ({FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).");
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index e95cd62..6638d97 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,6 +28,12 @@ pub struct Position {
+ 
+ mod cache;
+ mod packed_avx2;
++/// Benchmark-only access to private kernels (`--features bench-internals`). Not part of the API.
++#[cfg(feature = "bench-internals")]
++#[doc(hidden)]
++pub mod bench_internals {
++	pub use crate::packed_avx2::bench::*;
++}
+ mod packed_avx2_f32;
+ 
+ /// Runs the process-wide cache probe now instead of inside the first product (faer#232).
+diff --git a/src/packed_avx2.rs b/src/packed_avx2.rs
+index af4ed4f..ae05c50 100644
+--- a/src/packed_avx2.rs
++++ b/src/packed_avx2.rs
+@@ -6,6 +6,9 @@ use core::cell::Cell;
+ 
+ mod stream_rhs;
+ 
++#[cfg(feature = "bench-internals")]
++pub(crate) mod bench;
++
+ const MR: usize = 8;
+ const NR: usize = 6;
+ const ADD: usize = 1;
+@@ -121,6 +124,7 @@ pub(super) fn admitted_model(model: u8) -> bool {
+ // Each of the 48 accumulators follows the same depth order as the classical dot.
+ // Keep the lane grouping explicit so the compiler keeps all twelve sums in YMM registers.
+ // SAFETY: the caller must enable AVX2 and FMA.
++#[cfg(not(feature = "exp-newtile"))]
+ #[inline(always)]
+ unsafe fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
+ 	let first = _mm256_loadu_pd(a.as_ptr());
+@@ -134,6 +138,17 @@ unsafe fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
+ 	}
+ }
+ 
++// EXPERIMENT (local overlay, not for merge): the streamed tile's `mul_add` arithmetic inside the old packed tile.
++#[cfg(feature = "exp-newtile")]
++#[inline(always)]
++unsafe fn step(sums: &mut [[f64; MR]; NR], a: &[f64; MR], b: &[f64; NR]) {
++	for (col, &bj) in sums.iter_mut().zip(b) {
++		for (sum, &l) in col.iter_mut().zip(a) {
++			*sum = l.mul_add(bj, *sum);
++		}
++	}
++}
++
+ // A and B each contain depth full packed rows. RESUME loads the raw sums
+ // saved by the preceding panel. FINISH needs a full writable output tile;
+ // ADD also requires its entries to be initialized. Partial tiles use an
+diff --git a/src/packed_avx2/bench.rs b/src/packed_avx2/bench.rs
+new file mode 100644
+index 0000000..c7fd1e4
+--- /dev/null
++++ b/src/packed_avx2/bench.rs
+@@ -0,0 +1,110 @@
++//! Benchmark-only wrappers around the private AVX2 f64 kernels (feature `bench-internals`).
++//! Each wrapper forwards unchanged; no kernel code lives here. The same module compiles
++//! in trees with and without the streamed driver so one `benches/microkernel.rs` serves both.
++use super::*;
++
++pub const TILE_MR: usize = MR;
++pub const TILE_NR: usize = NR;
++pub const F_ADD: usize = ADD;
++pub const F_RESUME: usize = RESUME;
++pub const F_FINISH: usize = FINISH;
++
++pub type Driver = unsafe fn(
++	usize, usize, usize, *const f64, usize, *const f64, usize, *mut f64, usize,
++	f64, Accum, *mut f64, usize, *mut f64, usize, usize, usize,
++) -> bool;
++
++/// Packed 8 x 6 tile. `ldc_bytes` is the byte stride of the output columns.
++///
++/// # Safety
++/// Same contract as the private `tile`; the CPU must have AVX2 and FMA.
++pub unsafe fn tile_packed(a: *const f64, b: *const f64, c: *mut f64, ldc_bytes: usize, depth: usize, alpha: f64, partial: *mut f64, flags: usize) {
++	tile(a, b, c, ldc_bytes, depth, alpha, partial, flags)
++}
++
++/// A partial tile as the driver computes it: the packed tile into an edge buffer, then a
++/// copy of the valid `height x width` corner to `out`.
++///
++/// # Safety
++/// `out` must be writable for the valid corner; the CPU must have AVX2 and FMA.
++pub unsafe fn tile_edge(a: *const f64, b: *const f64, out: *mut f64, ldc: usize, height: usize, width: usize, depth: usize, add: bool) {
++	let mut edge = [0.; MR * NR];
++	let flags = usize::from(add) * ADD | FINISH;
++	if add {
++		for col in 0..width {
++			core::ptr::copy_nonoverlapping(out.add(col * ldc), edge.as_mut_ptr().add(col * MR), height);
++		}
++	}
++	tile(a, b, edge.as_mut_ptr(), 8 * MR, depth, 1.0, core::ptr::null_mut(), flags);
++	for col in 0..width {
++		core::ptr::copy_nonoverlapping(edge.as_ptr().add(col * MR), out.add(col * ldc), height);
++	}
++}
++
++/// # Safety
++/// As the private `pack_lhs`.
++pub unsafe fn pack_lhs_f64(a: *const f64, lda: usize, pa: *mut f64, rows: usize, depth: usize) {
++	pack_lhs(a, lda, pa, rows, depth)
++}
++/// # Safety
++/// As the private `pack_rhs`.
++pub unsafe fn pack_rhs_f64(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: usize) {
++	pack_rhs(b, ldb, pb, cols, depth)
++}
++/// # Safety
++/// As the private `pack_rhs_t`.
++pub unsafe fn pack_rhs_t_f64(b: *const f64, ldb: usize, pb: *mut f64, cols: usize, depth: usize) {
++	pack_rhs_t(b, ldb, pb, cols, depth)
++}
++
++/// The packed-panel driver (`multiply`), called without the CPU-model gate.
++pub fn packed_driver() -> Driver {
++	multiply
++}
++
++/// The streamed driver of the tree, if it has one, called without the CPU-model gate.
++pub fn stream_driver() -> Option<Driver> {
++	STREAM_DRIVER
++}
++
++/// Full streamed 8 x 6 tile loop over `panels` complete packed A panels, B read in place:
++/// `(depth, packed_a, b, ldb, out, ldc, panels)`.
++pub type StreamTile = unsafe fn(usize, *const f64, *const f64, usize, *mut f64, usize, usize);
++
++pub fn stream_tile() -> Option<StreamTile> {
++	STREAM_TILE
++}
++
++const STREAM_DRIVER: Option<Driver> = Some(stream_driver_entry);
++const STREAM_TILE: Option<StreamTile> = Some(stream_tile_entry);
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn stream_driver_entry(
++	m: usize, n: usize, k: usize, a: *const f64, lda: usize, b: *const f64, ldb: usize, c: *mut f64, ldc: usize,
++	alpha: f64, beta: Accum, pa: *mut f64, alen: usize, pb: *mut f64, blen: usize, l1: usize, l2: usize,
++) -> bool {
++	stream_rhs::multiply(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta, pa, alen, pb, blen, l1, l2)
++}
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn stream_tile_entry(depth: usize, packed: *const f64, b: *const f64, ldb: usize, out: *mut f64, ldc: usize, panels: usize) {
++	let columns: [*const f64; NR] = core::array::from_fn(|j| b.add(j * ldb));
++	stream_rhs::panels::<{ stream_rhs::COMPUTE }>(depth, packed, &columns, out, ldb, ldc, panels, core::ptr::null(), 0, core::ptr::null_mut(), None)
++}
++
++/// EXPERIMENT (local overlay): `panels` in a chosen mode (0 compute, 1 pack-panel, 2 pack-slab).
++#[target_feature(enable = "avx2,fma")]
++pub unsafe fn stream_tile_mode(mode: usize, depth: usize, packed: *const f64, b: *const f64, ldb: usize, out: *mut f64, ldc: usize, panels: usize, source: *const f64, lda: usize, dest: *mut f64) {
++	let columns: [*const f64; NR] = core::array::from_fn(|j| b.add(j * ldb));
++	match mode {
++		1 => stream_rhs::panels::<{ stream_rhs::PACK_PANEL }>(depth, packed, &columns, out, ldb, ldc, panels, source, lda, dest, None),
++		2 => stream_rhs::panels::<{ stream_rhs::PACK_SLAB }>(depth, packed, &columns, out, ldb, ldc, panels, source, lda, dest, None),
++		_ => stream_rhs::panels::<{ stream_rhs::COMPUTE }>(depth, packed, &columns, out, ldb, ldc, panels, core::ptr::null(), 0, core::ptr::null_mut(), None),
++	}
++}
++
++/// Detected `(L1d, L2, L3)` capacities in f64 elements, as `gemm` passes them to the driver.
++pub fn cache_elems() -> (usize, usize, usize) {
++	let c = *crate::cache::CACHE_INFO;
++	(c[0].cache_bytes / 8, c[1].cache_bytes / 8, c[2].cache_bytes / 8)
++}
+diff --git a/src/packed_avx2/stream_rhs.rs b/src/packed_avx2/stream_rhs.rs
+index a6e4a6f..60f5383 100644
+--- a/src/packed_avx2/stream_rhs.rs
++++ b/src/packed_avx2/stream_rhs.rs
+@@ -5,9 +5,9 @@ use super::{Accum, DEPTH_BLOCK, MR, NR, add_rank_one, pack_lhs};
+ 
+ // Number of explicit depth steps in the full-tile loop below.
+ const UNROLL: usize = 8;
+-const COMPUTE: usize = 0;
+-const PACK_PANEL: usize = 1;
+-const PACK_SLAB: usize = 2;
++pub(super) const COMPUTE: usize = 0;
++pub(super) const PACK_PANEL: usize = 1;
++pub(super) const PACK_SLAB: usize = 2;
+ 
+ /// Same view and scratch requirements as the parent packed driver. Check all
+ /// capacities before the first write so a caller can fall back on refusal.
+@@ -289,6 +289,25 @@ unsafe fn narrow_groups<const COLS: usize, const PANELS: usize>(
+ 
+ /// Each output follows the same increasing-depth FMA chain. Lanes in a
+ /// column are independent and can be vectorized together.
++#[cfg(feature = "exp-oldtile")]
++#[inline(always)]
++fn accumulate<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
++	// EXPERIMENT (local overlay, not for merge): the old packed tile's intrinsics inside the streamed driver.
++	use core::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
++	unsafe {
++		let first = _mm256_loadu_pd(left.as_ptr());
++		let second = _mm256_loadu_pd(left.as_ptr().add(4));
++		for (col, &r) in sums.iter_mut().zip(right) {
++			let factor = _mm256_set1_pd(r);
++			let low = _mm256_fmadd_pd(first, factor, _mm256_loadu_pd(col.as_ptr()));
++			let high = _mm256_fmadd_pd(second, factor, _mm256_loadu_pd(col.as_ptr().add(4)));
++			_mm256_storeu_pd(col.as_mut_ptr(), low);
++			_mm256_storeu_pd(col.as_mut_ptr().add(4), high);
++		}
++	}
++}
++
++#[cfg(not(feature = "exp-oldtile"))]
+ #[inline(always)]
+ fn accumulate<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
+ 	for (col, &r) in sums.iter_mut().zip(right) {
+@@ -302,7 +321,7 @@ fn accumulate<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR],
+ /// one source row fragment per unrolled group, completing a panel in eight column tiles.
+ #[inline(never)]
+ #[target_feature(enable = "avx2,fma")]
+-unsafe fn panels<const MODE: usize>(
++pub(super) unsafe fn panels<const MODE: usize>(
+ 	k: usize,
+ 	packed: *const f64,
+ 	columns: &[*const f64; NR],
+diff --git a/tests/fringe_bits.rs b/tests/fringe_bits.rs
+new file mode 100644
+index 0000000..8ecbfa7
+--- /dev/null
++++ b/tests/fringe_bits.rs
+@@ -0,0 +1,81 @@
++//! Bit identity of fringe handling (#27, checks #26's claim). Needs `--features bench-internals`.
++//!
++//! For every driver the tree offers (always the packed driver; the streamed driver when present):
++//!  1. each output equals the ordered scalar `mul_add` chain, bit for bit;
++//!  2. the product of an `m`-row A equals the first `m` rows of the product of the same A padded
++//!     with extra rows to a multiple of eight, so fringe rows round exactly as full-tile rows.
++#![cfg(feature = "bench-internals")]
++use private_gemm_x86::bench_internals as k;
++use private_gemm_x86::Accum;
++
++fn rng(seed: &mut u64) -> f64 {
++	*seed ^= *seed << 13;
++	*seed ^= *seed >> 7;
++	*seed ^= *seed << 17;
++	(*seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
++}
++
++fn reference(m: usize, n: usize, kk: usize, a: &[f64], lda: usize, b: &[f64]) -> Vec<f64> {
++	let mut c = vec![0.0; m * n];
++	for j in 0..n {
++		for i in 0..m {
++			let main = kk.min(512);
++			let mut dot = 0.0f64;
++			for p in 0..main {
++				dot = a[i + p * lda].mul_add(b[p + j * kk], dot);
++			}
++			if kk == 513 {
++				dot = a[i + 512 * lda].mul_add(b[512 + j * kk], 0.0) + dot;
++			}
++			c[i + j * m] = dot;
++		}
++	}
++	c
++}
++
++#[test]
++fn fringe_rows_round_like_full_tiles() {
++	if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
++		return;
++	}
++	let (l1, l2, l3) = k::cache_elems();
++	let mut pa = vec![0.0f64; l3.next_multiple_of(16)];
++	let mut pb = vec![0.0f64; l3.next_multiple_of(k::TILE_NR)];
++	let mut drivers: Vec<(&str, k::Driver)> = vec![("packed", k::packed_driver())];
++	if let Some(d) = k::stream_driver() {
++		drivers.push(("stream", d));
++	}
++	let mut seed = 0xC0FFEEu64;
++	let (mut checked, mut refused) = (0usize, 0usize);
++	for (name, d) in &drivers {
++		for &kk in &[8usize, 9, 64, 139, 257, 512, 513] {
++			for &n in &[1usize, 5, 6, 7, 13, 24, 25] {
++				for m in 8usize..=41 {
++					let mp = m.next_multiple_of(8);
++					let a: Vec<f64> = (0..mp * kk).map(|_| rng(&mut seed)).collect();
++					let b: Vec<f64> = (0..kk * n).map(|_| rng(&mut seed)).collect();
++					let mut c = vec![f64::NAN; m * n];
++					let mut cp = vec![f64::NAN; mp * n];
++					// the m-row view of the padded A: same leading dimension, fewer rows
++					let ok = unsafe { d(m, n, kk, a.as_ptr(), mp, b.as_ptr(), kk, c.as_mut_ptr(), m, 1.0, Accum::Replace, pa.as_mut_ptr(), pa.len(), pb.as_mut_ptr(), pb.len(), l1, l2) };
++					let okp = unsafe { d(mp, n, kk, a.as_ptr(), mp, b.as_ptr(), kk, cp.as_mut_ptr(), mp, 1.0, Accum::Replace, pa.as_mut_ptr(), pa.len(), pb.as_mut_ptr(), pb.len(), l1, l2) };
++					if !ok || !okp {
++						refused += 1;
++						continue;
++					}
++					checked += 1;
++					let want = reference(m, n, kk, &a, mp, &b);
++					for j in 0..n {
++						for i in 0..m {
++							let got = c[i + j * m].to_bits();
++							assert_eq!(got, want[i + j * m].to_bits(), "{name}: scalar mismatch m={m} n={n} k={kk} ({i},{j})");
++							assert_eq!(got, cp[i + j * mp].to_bits(), "{name}: padded-A mismatch m={m} n={n} k={kk} ({i},{j})");
++						}
++					}
++				}
++			}
++		}
++		eprintln!("{name}: checked {checked} products, driver refused {refused}");
++	}
++	assert!(checked > 0);
++}

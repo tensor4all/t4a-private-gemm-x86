@@ -1,0 +1,30 @@
+mk-default-B0: 29 functions matching ['packed_avx2::'], 8761 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-default-N: 27 functions matching ['packed_avx2::'], 8119 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-x86-64-v3-B0: 29 functions matching ['packed_avx2::'], 9770 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-x86-64-v3-N: 27 functions matching ['packed_avx2::'], 9208 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-raptorlake-B0: 29 functions matching ['packed_avx2::'], 10856 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-raptorlake-N: 27 functions matching ['packed_avx2::'], 10295 instructions; EVEX 0, zmm 0, xmm/ymm16-31 0, mask 0
+mk-znver5-B0: 29 functions matching ['packed_avx2::'], 9766 instructions; EVEX 1443, zmm 1132, xmm/ymm16-31 301, mask 34
+   private_gemm_x86::packed_avx2::add_rank_one: EVEX 55 zmm 55 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::tile: EVEX 169 zmm 0 hi-regs 169 mask 0
+   private_gemm_x86::packed_avx2::multiply: EVEX 46 zmm 41 hi-regs 0 mask 17
+   private_gemm_x86::packed_avx2::stream_rhs::narrow_groups::<4, 1>: EVEX 65 zmm 65 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::narrow_groups::<5, 1>: EVEX 80 zmm 80 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<0>: EVEX 98 zmm 98 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<1>: EVEX 116 zmm 116 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<2>: EVEX 100 zmm 100 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::multiply: EVEX 666 zmm 534 hi-regs 132 mask 0
+   private_gemm_x86::packed_avx2::bench::pack_lhs_f64: EVEX 18 zmm 18 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::bench::pack_rhs_f64: EVEX 24 zmm 19 hi-regs 0 mask 17
+   private_gemm_x86::packed_avx2::bench::tile_edge: EVEX 6 zmm 6 hi-regs 0 mask 0
+mk-znver5-N: 27 functions matching ['packed_avx2::'], 10469 instructions; EVEX 1212, zmm 231, xmm/ymm16-31 962, mask 34
+   private_gemm_x86::packed_avx2::add_rank_one: EVEX 55 zmm 55 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::tile: EVEX 169 zmm 0 hi-regs 169 mask 0
+   private_gemm_x86::packed_avx2::multiply: EVEX 46 zmm 41 hi-regs 0 mask 17
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<0>: EVEX 204 zmm 0 hi-regs 204 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<1>: EVEX 222 zmm 18 hi-regs 204 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::panels::<2>: EVEX 206 zmm 2 hi-regs 204 mask 0
+   private_gemm_x86::packed_avx2::stream_rhs::multiply: EVEX 262 zmm 72 hi-regs 181 mask 0
+   private_gemm_x86::packed_avx2::bench::pack_lhs_f64: EVEX 18 zmm 18 hi-regs 0 mask 0
+   private_gemm_x86::packed_avx2::bench::pack_rhs_f64: EVEX 24 zmm 19 hi-regs 0 mask 17
+   private_gemm_x86::packed_avx2::bench::tile_edge: EVEX 6 zmm 6 hi-regs 0 mask 0

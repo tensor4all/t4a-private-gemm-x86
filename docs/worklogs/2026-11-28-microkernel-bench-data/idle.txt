@@ -1,0 +1,24 @@
+pre-run r1 cpu2(16384K) old: sibling cpu14 busy 0%  target busy 0%
+post-run r1 cpu2 old: sibling busy over run 0%
+pre-run r1 cpu2(16384K) new: sibling cpu14 busy 2%  target busy 2%
+post-run r1 cpu2 new: sibling busy over run 0%
+pre-run r1 cpu6(8192K) old: sibling cpu18 busy 0%  target busy 0%
+post-run r1 cpu6 old: sibling busy over run 0%
+pre-run r1 cpu6(8192K) new: sibling cpu18 busy 2%  target busy 0%
+post-run r1 cpu6 new: sibling busy over run 0%
+pre-run r2 cpu6(8192K) new: sibling cpu18 busy 0%  target busy 0%
+post-run r2 cpu6 new: sibling busy over run 0%
+pre-run r2 cpu6(8192K) old: sibling cpu18 busy 0%  target busy 0%
+post-run r2 cpu6 old: sibling busy over run 0%
+pre-run r2 cpu2(16384K) new: sibling cpu14 busy 0%  target busy 0%
+post-run r2 cpu2 new: sibling busy over run 0%
+pre-run r2 cpu2(16384K) old: sibling cpu14 busy 0%  target busy 1%
+post-run r2 cpu2 old: sibling busy over run 0%
+pre-run r3 cpu2(16384K) old: sibling cpu14 busy 1%  target busy 2%
+post-run r3 cpu2 old: sibling busy over run 0%
+pre-run r3 cpu2(16384K) new: sibling cpu14 busy 0%  target busy 1%
+post-run r3 cpu2 new: sibling busy over run 0%
+pre-run r3 cpu6(8192K) old: sibling cpu18 busy 0%  target busy 0%
+post-run r3 cpu6 old: sibling busy over run 0%
+pre-run r3 cpu6(8192K) new: sibling cpu18 busy 0%  target busy 0%
+post-run r3 cpu6 new: sibling busy over run 0%
