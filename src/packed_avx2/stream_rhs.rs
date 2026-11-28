@@ -330,6 +330,17 @@ unsafe fn store_column_rank(dst: *mut f64, col: &[f64; MR], left: *const f64, v:
 	_mm256_storeu_pd(dst.add(4), high);
 }
 
+/// Each output follows the same increasing-depth FMA chain. Lanes in a
+/// column are independent and can be vectorized together.
+#[inline(always)]
+fn accumulate_while_packing<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
+	for (col, &r) in sums.iter_mut().zip(right) {
+		for (sum, &l) in col.iter_mut().zip(left) {
+			*sum = l.mul_add(r, *sum);
+		}
+	}
+}
+
 /// The hot loop is shared by all three packing modes. Slab mode copies
 /// one source row fragment per unrolled group, completing a panel in eight column tiles.
 #[inline(never)]
@@ -363,7 +374,11 @@ unsafe fn panels<const MODE: usize>(
 				let p = $index;
 				let left = &*a.add(p * MR).cast::<[f64; MR]>();
 				let right = core::array::from_fn(|j| *columns[j].add(p));
-				accumulate(&mut cols, left, &right);
+				if MODE == COMPUTE {
+					accumulate(&mut cols, left, &right);
+				} else {
+					accumulate_while_packing(&mut cols, left, &right);
+				}
 				if MODE == PACK_PANEL {
 					core::ptr::copy_nonoverlapping(src.add(p * lda), dst.add(p * MR), MR);
 				}
