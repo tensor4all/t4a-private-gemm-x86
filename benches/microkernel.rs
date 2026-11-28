@@ -61,10 +61,17 @@ fn time<F: FnMut()>(mut f: F) -> f64 {
 }
 
 impl Ctx {
+	/// A row whose ISA peak is the AVX2 peak (`%avx2 == %isa`).
 	fn row(&mut self, group: &str, name: &str, shape: &str, ns: f64, flops: f64) {
+		self.row_isa(group, name, shape, ns, flops, FLOPS_PER_CYCLE);
+	}
+	/// `isa_fpc` is the flop/cycle the row's instruction set can issue: 16 for AVX2, 32 for AVX-512
+	/// (2 x 512-bit FMA). `%avx2` is always against 16 flop/cycle; `%isa` against `isa_fpc`.
+	fn row_isa(&mut self, group: &str, name: &str, shape: &str, ns: f64, flops: f64, isa_fpc: f64) {
 		let gf = flops / ns;
 		let pct = gf / (self.ghz * FLOPS_PER_CYCLE) * 100.0;
-		let line = format!("{group:<8} {name:<34} {shape:<16} {ns:>12.1} {gf:>9.2} {pct:>7.1}%");
+		let isa = gf / (self.ghz * isa_fpc) * 100.0;
+		let line = format!("{group:<8} {name:<34} {shape:<16} {ns:>12.1} {gf:>9.2} {pct:>7.1}% {isa:>7.1}%");
 		println!("{line}");
 		self.rows.push(line);
 	}
@@ -165,11 +172,11 @@ fn main() {
 	println!("boost      : {} (1 = turbo/boost on)", sh("cat /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null | tr '\\n' ' '"));
 	println!("cache f64s : L1d {l1}  L2 {l2}  L3 {l3}");
 	println!("clock      : measured {measured:.3} GHz (dependent-add chain), used for peak {ghz:.3} GHz");
-	println!("peak/core  : {FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz = {:.2} GFLOP/s", FLOPS_PER_CYCLE * ghz);
+	println!("peak/core  : %avx2 = {FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz = {:.2} GFLOP/s; %isa = {} flop/cycle for AVX-512 rows = {:.2} GFLOP/s (AVX2 rows: same as %avx2)", FLOPS_PER_CYCLE * ghz, 2.0 * FLOPS_PER_CYCLE, 2.0 * FLOPS_PER_CYCLE * ghz);
 	println!("method     : median of {SAMPLES} samples, each >= {MIN_SAMPLE:?} of back-to-back calls, 100 ms warm-up");
 	println!("stream drv : {}   stream tile: {}", k::stream_driver().is_some(), k::stream_tile().is_some());
 	println!();
-	println!("{:<8} {:<34} {:<16} {:>12} {:>9} {:>8}", "group", "kernel", "shape", "ns/call", "GFLOP/s", "%peak");
+	println!("{:<8} {:<34} {:<16} {:>12} {:>9} {:>8} {:>8}", "group", "kernel", "shape", "ns/call", "GFLOP/s", "%avx2", "%isa");
 	let mut c = Ctx { ghz, rows: vec![] };
 	let mut seed = 0x9E3779B97F4A7C15u64;
 	let (mr, nr) = (k::TILE_MR, k::TILE_NR);
@@ -218,6 +225,56 @@ fn main() {
 					black_box(&mut out);
 				});
 				c.row("tile", "stream full tile (B in place)", &format!("k={depth} x{panels}panel"), ns, flops);
+			}
+		}
+	}
+
+	if want("tile512") && k::avx512_available() {
+		// AVX-512 f64 asm microkernels as `gemm_impl` calls them: 48 x 4 (nrows > 48) and 24 x 8 (nrows <= 48).
+		// Operands column-major in place, one tile per call. Peak for %isa: 32 flop/cycle.
+		let isa = 2.0 * FLOPS_PER_CYCLE;
+		for (wide, mr5, nr5) in [(false, 48usize, 4usize), (true, 24, 8)] {
+			let label = if wide { "avx512 24x8" } else { "avx512 48x4" };
+			for depth in [16usize, 64, 192] {
+				let a = vec(depth * mr5, &mut seed);
+				let b = vec(depth * nr5, &mut seed);
+				let mut out = vec![0.0; mr5 * nr5];
+				let flops = (2 * mr5 * nr5 * depth) as f64;
+				let ns = time(|| unsafe {
+					k::avx512_tile(wide, mr5, nr5, depth, black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), false);
+					black_box(&mut out);
+				});
+				c.row_isa("tile512", &format!("{label} replace"), &format!("k={depth}"), ns, flops, isa);
+			}
+			let depth = 192usize;
+			let a = vec(depth * mr5, &mut seed);
+			let b = vec(depth * nr5, &mut seed);
+			let mut out = vec![0.5; mr5 * nr5];
+			let flops = (2 * mr5 * nr5 * depth) as f64;
+			let ns = time(|| unsafe {
+				k::avx512_tile(wide, mr5, nr5, depth, black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), true);
+				black_box(&mut out);
+			});
+			c.row_isa("tile512", &format!("{label} accumulate"), &format!("k={depth}"), ns, flops, isa);
+			// Fringe: useful flops only, same depth, against the full tile above.
+			let mut out = vec![0.0; mr5 * nr5];
+			let fr: &[(usize, usize)] = if wide { &[(24, 8), (23, 8), (16, 8), (8, 8), (1, 8), (24, 4), (24, 1), (8, 2), (1, 1)] } else { &[(48, 4), (47, 4), (32, 4), (16, 4), (8, 4), (1, 4), (48, 3), (48, 1), (8, 2), (1, 1)] };
+			for &(h, w) in fr {
+				let flops = (2 * h * w * depth) as f64;
+				// Check the call contract before timing: valid corner equals the scalar sum, rest untouched.
+				out.iter_mut().for_each(|x| *x = f64::NAN);
+				unsafe { k::avx512_tile(wide, h, w, depth, a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), false) };
+				for j in 0..w {
+					for i in 0..h {
+						let r: f64 = (0..depth).map(|p| a[i + mr5 * p] * b[p + depth * j]).sum();
+						assert!((out[i + mr5 * j] - r).abs() <= 1e-9 * r.abs().max(1.0), "avx512 tile {label} {h}x{w}: wrong value at ({i},{j})");
+					}
+				}
+				let ns = time(|| unsafe {
+					k::avx512_tile(wide, h, w, depth, black_box(a.as_ptr()), black_box(b.as_ptr()), out.as_mut_ptr(), false);
+					black_box(&mut out);
+				});
+				c.row_isa("tile512", &format!("{label} fringe"), &format!("{h}x{w} k={depth}"), ns, flops, isa);
 			}
 		}
 	}
@@ -316,7 +373,7 @@ fn main() {
 					black_box(&mut out);
 				});
 				// peak for Avx512 would double; report against the AVX2 denominator and say so.
-				c.row("e2e", name, &shape, ns, flops);
+				c.row_isa("e2e", name, &shape, ns, flops, if matches!(instr, InstrSet::Avx512) { 2.0 * FLOPS_PER_CYCLE } else { FLOPS_PER_CYCLE });
 			}
 		}
 	}
@@ -345,5 +402,5 @@ fn main() {
 		}
 	}
 	println!();
-	println!("%peak = GFLOP/s / ({FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).");
+	println!("%avx2 = GFLOP/s / ({FLOPS_PER_CYCLE} flop/cycle x {ghz:.3} GHz), the AVX2 FMA peak, for every row. %isa = the same against the row's own ISA peak ({} flop/cycle for AVX-512 rows); equal to %avx2 on AVX2 rows.", 2.0 * FLOPS_PER_CYCLE);
 }
