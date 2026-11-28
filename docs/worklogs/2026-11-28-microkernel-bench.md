@@ -101,7 +101,7 @@ What was called: the generated AVX-512 f64 asm microkernels exactly as `gemm_imp
 Findings:
 
 - **Tile**: 48x4 and 24x8 are the same speed (31.2 GFLOP/s at k=192, 97.9 % of the AVX2 peak, 48.9 % of the AVX-512 nominal peak). The AVX2 8x6 packed tile is 99.1 %. So there is **no throughput gain from 512-bit shape on this part, and the 512-bit-shaped tile is not leaving more than about 2 points on the table** against the 16 flop/cycle ceiling.
-- **Fringe**: a partial tile costs the same time as a full one at equal depth, so useful flop/s falls with the fraction of the tile used: 47x4 and 23x8 (one row short) 95.5 % and 93.8 % `%avx2`; 8-row and 16-row fringes about 96-97 %; fewer columns costs more (48x3 96.8 %, 48x1 45 %, 24x1 55 %); 1-row and 1x1 fringes 3-12 %. The AVX2 8x6 fringes in the `edge` group are the matching rows.
+- **Fringe**: a partial tile costs the same time as a full one at equal depth, so useful flop/s falls with the fraction of the tile used: 47x4 and 23x8 (one row short) 95.5 % and 93.8 % `%avx2`; 8-row and 16-row fringes about 96-98 %; fewer columns costs more (48x3 96.8 %, 48x1 45 %, 24x1 55 %); 1-row and 1x1 fringes 3-12 %. The AVX2 8x6 fringes in the `edge` group are the matching rows.
 - **End to end**: AVX-512 `gemm` 31.0-31.6 GFLOP/s (95-99 % `%avx2`) against 29.7-30.5 (94-96 %) for forced AVX2: **3.3-4.7 % faster at the five square-ish shapes** on both core types. The tile alone does not explain it (the AVX-512 tile is slower than the AVX2 tile); that is a driver-level difference I did not isolate.
 - **Zen 5 vs Zen 5c**: same ordering; the c core is 0.5-1.5 % slower in ns on tiles, within the clock difference of about 0.7 %.
 
