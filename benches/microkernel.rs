@@ -161,7 +161,7 @@ fn main() {
 	println!("affinity   : {allowed} (verified single CPU)");
 	println!("core       : {core_line}");
 	println!("ran on cpu : {} (sched_getcpu at start)", unsafe { sched_getcpu() });
-	println!("commit     : {}", option_env!("BENCH_COMMIT").unwrap_or("unrecorded"));
+	println!("commit     : {}", std::env::var("BENCH_COMMIT").unwrap_or_else(|_| "unrecorded".into()));
 	println!("boost      : {} (1 = turbo/boost on)", sh("cat /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null | tr '\\n' ' '"));
 	println!("cache f64s : L1d {l1}  L2 {l2}  L3 {l3}");
 	println!("clock      : measured {measured:.3} GHz (dependent-add chain), used for peak {ghz:.3} GHz");
