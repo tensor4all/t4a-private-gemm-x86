@@ -169,3 +169,8 @@ Full write-up, tables, disassembly, scripts and the overlay patch (the overlay i
 - Under `-C target-cpu=znver5` the spills disappear (packed `mul_add` ÷ intrinsics 0.99-1.00); under default, `x86-64-v3` and `raptorlake` they remain (packed tile 1.02-1.09; streamed PACK_SLAB up to 2.1x). The intrinsics loops are stable in every build.
 - Hardware counters were not collected (`kernel.perf_event_paranoid` = 4, no root); instruction counts are derived from the disassembly.
 - Limits: absolute ns of identical source differs by about 2.7 % between separately built binaries, and driver times at 512^3 move 6-9 % between builds with the same hot loop, so a driver-level gap of that size cannot be assigned to the instruction stream with this evidence.
+
+
+## Streamed tile with explicit intrinsics, and the AVX-512 check (#26)
+
+Branch `fix/streamed-tile-intrinsics` (8219ead, on #26's 3016c7e); data and scan in `2026-11-28-microkernel-bench-data/tile-intrinsics/`. Summary: the intrinsics tile is bit-identical to the `mul_add` chain (unit test, which fails under a deliberate mul-then-add mutation; driver test 0 mismatches), runs at the speed of the old intrinsics tile in every build (new / config 3 = 0.985-1.016), and removes the pack-mode spills in the default build (PACK_PANEL 129 -> 5 stack accesses, PACK_SLAB 58 -> 16). The AVX-512-free property holds for default, `x86-64-v3` and `raptorlake` builds (0 EVEX instructions in the AVX2 module) but **not** under `-C target-cpu=znver5`: the tile has no `zmm` but is EVEX-encoded (`ymm16-31`), and the pack copies, `multiply` and `add_rank_one` still emit `zmm`.
