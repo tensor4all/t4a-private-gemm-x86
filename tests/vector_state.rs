@@ -26,7 +26,10 @@ use std::arch::x86_64::__cpuid_count;
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
 
-use private_gemm_x86::{Accum, DType, DstKind, Fork, IType, InstrSet, MilliScratch, gemm, gemm_stack_bytes, gemm_with, gemm_with_scratch, gemm_with_stack, syrk_lower_block};
+use private_gemm_x86::{
+	Accum, DType, DstKind, Fork, IType, InstrSet, MilliScratch, gemm, gemm_stack_bytes, gemm_with, gemm_with_scratch, gemm_with_stack,
+	syrk_lower_block,
+};
 
 const YMM_HI128: u64 = 1 << 2;
 const ZMM_HI256: u64 = 1 << 6;
@@ -97,16 +100,24 @@ const WIDTH: usize = 4;
 /// Runs one product through `entry`; returns the `XINUSE` upper bits per participant.
 fn run(entry: Entry, dtype: DType, sizeof: usize, instr: InstrSet) -> Vec<(String, u64)> {
 	let (m, n, k) = SHAPE;
-	let a = vec![0x3fu8; m * k * sizeof];
-	let b = vec![0x3fu8; k * n * sizeof];
+	let a = vec![0x3Fu8; m * k * sizeof];
+	let b = vec![0x3Fu8; k * n * sizeof];
 	let mut dst = vec![0u8; m * n * sizeof];
 	let mut alpha = vec![0u8; 16];
 	match dtype {
 		DType::F32 | DType::C32 => alpha[..4].copy_from_slice(&1.0f32.to_ne_bytes()),
 		DType::F64 | DType::C64 => alpha[..8].copy_from_slice(&1.0f64.to_ne_bytes()),
 	}
-	let fork = CheckFork { width: WIDTH, seen: Mutex::new(Vec::new()) };
-	let (d, a, b, al) = (dst.as_mut_ptr() as *mut (), a.as_ptr() as *const (), b.as_ptr() as *const (), alpha.as_ptr() as *const ());
+	let fork = CheckFork {
+		width: WIDTH,
+		seen: Mutex::new(Vec::new()),
+	};
+	let (d, a, b, al) = (
+		dst.as_mut_ptr() as *mut (),
+		a.as_ptr() as *const (),
+		b.as_ptr() as *const (),
+		alpha.as_ptr() as *const (),
+	);
 	macro_rules! args {
 		($call:ident $(, $extra:expr)*) => {
 			$call(dtype, IType::U64, instr, m, n, k, d, 1, m as isize, std::ptr::null(), std::ptr::null(), DstKind::Full, Accum::Replace,
@@ -120,11 +131,11 @@ fn run(entry: Entry, dtype: DType, sizeof: usize, instr: InstrSet) -> Vec<(Strin
 			Entry::GemmWithScratch => {
 				let mut mem = vec![0u8; MilliScratch::required(m, n)];
 				args!(gemm_with_scratch, &fork, MilliScratch::new(&mut mem))
-			}
+			},
 			Entry::GemmWithStack => {
 				let mut stack = vec![MaybeUninit::<u8>::uninit(); gemm_stack_bytes(dtype, instr, m, n, k)];
 				args!(gemm_with_stack, &mut stack)
-			}
+			},
 		}
 	}
 	// the caller, after the entry returned: this is the boundary a consumer sees
@@ -147,13 +158,21 @@ fn check_entry(entry: Entry) {
 			for (who, bits) in run(entry, dtype, sizeof, instr) {
 				checked += 1;
 				if bits != 0 {
-					dirty.push(format!("{entry:?} {dtype:?} {instr:?} {who}: XINUSE upper bits {bits:#x} (bit2 YMM_Hi128={}, bit6 ZMM_Hi256={})", bits & YMM_HI128 != 0, bits & ZMM_HI256 != 0));
+					dirty.push(format!(
+						"{entry:?} {dtype:?} {instr:?} {who}: XINUSE upper bits {bits:#x} (bit2 YMM_Hi128={}, bit6 ZMM_Hi256={})",
+						bits & YMM_HI128 != 0,
+						bits & ZMM_HI256 != 0
+					));
 				}
 			}
 		}
 	}
 	println!("{entry:?}: {checked} (dtype, isa, thread) observations, {} dirty", dirty.len());
-	assert!(dirty.is_empty(), "kernels returned with a dirty upper vector state:\n{}", dirty.join("\n"));
+	assert!(
+		dirty.is_empty(),
+		"kernels returned with a dirty upper vector state:\n{}",
+		dirty.join("\n")
+	);
 }
 
 #[test]
