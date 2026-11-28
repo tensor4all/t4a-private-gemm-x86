@@ -1,0 +1,65 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 2 (verified single CPU)
+core       : cpu2 (smt sibling 2,14), L3 16384K shared by 0-3,12-15, L2 1024K
+ran on cpu : 2 (sched_getcpu at start)
+commit     : 5a6171c
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 6291456
+clock      : measured 1.994 GHz (dependent-add chain), used for peak 1.994 GHz
+peak/core  : %avx2 = 16 flop/cycle x 1.994 GHz = 31.90 GFLOP/s; %isa = 32 flop/cycle for AVX-512 rows = 63.81 GFLOP/s (AVX2 rows: same as %avx2)
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : false   stream tile: false
+
+group    kernel                             shape                 ns/call   GFLOP/s    %avx2     %isa
+tile     packed FINISH(replace)             k=16                     51.3     29.97    93.9%    93.9%
+tile     packed FINISH(replace)             k=64                    196.4     31.28    98.0%    98.0%
+tile     packed FINISH(replace)             k=192                   582.9     31.62    99.1%    99.1%
+tile     packed FINISH|ADD                  k=192                   582.7     31.63    99.2%    99.2%
+tile     packed RESUME|FINISH|ADD           k=192                   583.4     31.59    99.0%    99.0%
+tile     packed (no FINISH: spill sums)     k=192                   580.4     31.76    99.5%    99.5%
+tile512  avx512 48x4 replace                k=16                    238.9     25.72    80.6%    40.3%
+tile512  avx512 48x4 replace                k=64                    817.4     30.07    94.2%    47.1%
+tile512  avx512 48x4 replace                k=192                  2362.3     31.21    97.8%    48.9%
+tile512  avx512 48x4 accumulate             k=192                  2361.7     31.22    97.9%    48.9%
+tile512  avx512 48x4 fringe                 48x4 k=192             2372.6     31.08    97.4%    48.7%
+tile512  avx512 48x4 fringe                 47x4 k=192             2370.3     30.46    95.5%    47.7%
+tile512  avx512 48x4 fringe                 32x4 k=192             1581.3     31.08    97.4%    48.7%
+tile512  avx512 48x4 fringe                 16x4 k=192              802.2     30.63    96.0%    48.0%
+tile512  avx512 48x4 fringe                 8x4 k=192               400.1     30.71    96.3%    48.1%
+tile512  avx512 48x4 fringe                 1x4 k=192               466.1      3.30    10.3%     5.2%
+tile512  avx512 48x4 fringe                 48x3 k=192             1789.9     30.89    96.8%    48.4%
+tile512  avx512 48x4 fringe                 48x1 k=192             1263.9     14.58    45.7%    22.9%
+tile512  avx512 48x4 fringe                 8x2 k=192               386.0     15.92    49.9%    24.9%
+tile512  avx512 48x4 fringe                 1x1 k=192               386.2      0.99     3.1%     1.6%
+tile512  avx512 24x8 replace                k=16                    236.4     25.99    81.5%    40.7%
+tile512  avx512 24x8 replace                k=64                    814.0     30.19    94.6%    47.3%
+tile512  avx512 24x8 replace                k=192                  2361.4     31.22    97.9%    48.9%
+tile512  avx512 24x8 accumulate             k=192                  2360.9     31.23    97.9%    48.9%
+tile512  avx512 24x8 fringe                 24x8 k=192             2361.0     31.23    97.9%    48.9%
+tile512  avx512 24x8 fringe                 23x8 k=192             2361.6     29.92    93.8%    46.9%
+tile512  avx512 24x8 fringe                 16x8 k=192             1577.3     31.16    97.7%    48.8%
+tile512  avx512 24x8 fringe                 8x8 k=192               790.2     31.10    97.5%    48.7%
+tile512  avx512 24x8 fringe                 1x8 k=192               792.7      3.88    12.1%     6.1%
+tile512  avx512 24x8 fringe                 24x4 k=192             1184.3     31.13    97.6%    48.8%
+tile512  avx512 24x8 fringe                 24x1 k=192              513.4     17.95    56.3%    28.1%
+tile512  avx512 24x8 fringe                 8x2 k=192               383.6     16.02    50.2%    25.1%
+tile512  avx512 24x8 fringe                 1x1 k=192               384.1      1.00     3.1%     1.6%
+e2e      gemm Avx512 (host default)         191x257x139          436506.8     31.26    98.0%    49.0%
+e2e      gemm Avx256 (forced)               191x257x139          451088.9     30.25    94.8%    94.8%
+e2e      gemm Avx512 (host default)         192x257x139          435184.2     31.52    98.8%    49.4%
+e2e      gemm Avx256 (forced)               192x257x139          452201.0     30.34    95.1%    95.1%
+e2e      gemm Avx512 (host default)         256x256x256         1066050.5     31.48    98.7%    49.3%
+e2e      gemm Avx256 (forced)               256x256x256         1116574.5     30.05    94.2%    94.2%
+e2e      gemm Avx512 (host default)         511x511x511         8481026.0     31.47    98.6%    49.3%
+e2e      gemm Avx256 (forced)               511x511x511         8777588.0     30.40    95.3%    95.3%
+e2e      gemm Avx512 (host default)         512x512x512         8501945.0     31.57    99.0%    49.5%
+e2e      gemm Avx256 (forced)               512x512x512         8804018.0     30.49    95.6%    95.6%
+e2e      gemm Avx512 (host default)         256x32x256           138258.1     30.34    95.1%    47.5%
+e2e      gemm Avx256 (forced)               256x32x256           140256.2     29.90    93.7%    93.7%
+e2e      gemm Avx512 (host default)         256x512x256         2128754.0     31.52    98.8%    49.4%
+e2e      gemm Avx256 (forced)               256x512x256         2196581.0     30.55    95.8%    95.8%
+e2e      gemm Avx512 (host default)         256x513x256         2148481.0     31.30    98.1%    49.0%
+e2e      gemm Avx256 (forced)               256x513x256         2225655.0     30.21    94.7%    94.7%
+
+%avx2 = GFLOP/s / (16 flop/cycle x 1.994 GHz), the AVX2 FMA peak, for every row. %isa = the same against the row's own ISA peak (32 flop/cycle for AVX-512 rows); equal to %avx2 on AVX2 rows.

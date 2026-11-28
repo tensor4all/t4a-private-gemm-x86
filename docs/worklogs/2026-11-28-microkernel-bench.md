@@ -11,7 +11,9 @@ Compile-only in CI (`cargo build --profile ci --features bench-internals --bench
 
 ## Definitions
 
-- Peak per core = 2 FMA units × 4 doubles × 2 flops = **16 flop/cycle** (documented AVX2 FMA throughput) × the clock in the run. The clock is measured by a dependent-add chain on the pinned core and printed; here it was **1.99 GHz** (`cpuinfo_max_freq` is 2.0 GHz, boost off) → **31.8 GFLOP/s**. `%peak` always uses this AVX2 denominator, including the AVX-512 end-to-end rows (which are not bounded by it).
+- Peak per core = 2 FMA units × 4 doubles × 2 flops = **16 flop/cycle** (documented AVX2 FMA throughput) × the clock in the run. The clock is measured by a dependent-add chain on the pinned core and printed; here it was **1.99 GHz** (`cpuinfo_max_freq` is 2.0 GHz, boost off) → **31.8 GFLOP/s**. Two columns since `5a6171c`: **`%avx2`** is against this AVX2 peak for every row; **`%isa`** is against the row's own instruction-set peak: 16 flop/cycle for AVX2 rows (so `%isa == %avx2`) and 32 flop/cycle for AVX-512 rows (2 x 512-bit FMA, 63.6 GFLOP/s at 1.99 GHz). The old single `%peak` column was `%avx2`; tables above this section are unchanged and keep that name.
+
+**On this part AVX-512 f64 runs at AVX2 throughput.** AVX-512 executes at 256-bit width here, so an AVX-512 row at `%isa` ≈ 49 is at the part's real f64 limit (`%avx2` ≈ 98), not at half of it. Measured: the AVX-512 tile reaches 31.2 GFLOP/s (97.9 % of the AVX2 peak) against 31.6 (99.1 %) for the AVX2 8x6 tile, so the tile is 1.2 points below it, not above. End to end, AVX-512 `gemm` is 3-5 % faster than forced AVX2 (below). Do not read a `%avx2` of 98.9 on an AVX-512 row as "near the AVX-512 peak"; read `%isa`.
 - Repetitions: median of **31 samples**, each ≥ 2 ms of back-to-back calls, 100 ms warm-up. Table values below are the median of **3 rounds** of that median; round order alternated.
 - Groups: `tile` (L1-resident packed tile, per flag), `edge` (fringe tiles), `pack` (packing alone, GB/s), `driver` (whole driver, scratch preallocated, no public dispatch and no CPU gate), `e2e` (public `gemm`, dispatch included).
 
@@ -88,3 +90,71 @@ Hypothesis: Raptor Cove's 48 KiB L1D, 2 MiB L2 and prefetcher keep up with a six
 - The story predicts "streaming wins" on both, and no difference between them. It does win on both, and the two core types agree within about 2 %. That is consistent with the story, but not a test of it: no core here has a smaller L1.
 - One manipulation of effective capacity is available: a pointer-chasing thrash on the SMT sibling (random read-modify-write over 64 KiB, `sibling-loaded/thrash.c`) takes a share of L1/L2 and load ports. With it, the baseline slows 4–5 %, and the config 3 ratios are essentially unchanged (0.907–0.978 loaded, 0.907–0.975 unloaded); no shape flips to packing. Config 4 improves relative to baseline at small sizes (0.93–0.97) and still loses 3–8 % at k ≥ 511. The new tile's penalty in config 2 grows (1.045–1.094 vs 1.016–1.061).
 - This does not test the prefetcher part of the claim (the sibling shares the prefetcher), and the loader also contends for load/store ports and the front end, so it is a confounded stand-in for a smaller L1. The hypothesis is therefore **not decided here**: an Intel core with a smaller L1 or an older core without the strong prefetcher is needed.
+
+
+## AVX-512 tile, its fringe, and `%isa` (#28 follow-up)
+
+Commit `5a6171c`. Same host, pins and protocol as above (cpu 2 = Zen 5, cpu 6 = Zen 5c; sibling 0 % busy before and during every run, `avx512/idle.txt`; L3 checked before each run; median of 31 samples; **median of 3 rounds**, core order alternated). Measured clocks 1.992-1.995 GHz (Zen 5) and 1.979-1.982 GHz (Zen 5c); each run's own clock is its denominator. Raw: `2026-11-28-microkernel-bench-data/avx512/`; `aggregate.py` makes the table; `run.sh` runs it.
+
+What was called: the generated AVX-512 f64 asm microkernels exactly as `gemm_impl` selects them: **48 x 4** (`F64_SIMD512x4[3]`, used when `nrows > 48`) and **24 x 8** (`F64_SIMD512x8[7]`, `nrows <= 48`), through one `millikernel_colmajor` call per tile, operands column-major in place (no packing), `bench_internals::avx512_tile`. This is not the AVX2 "packed tile" call: there is no separate pack step for these kernels in the bench, and one call carries the millikernel loop overhead. The bench checks every fringe call against a scalar sum (and that the rest of the tile is untouched) before timing it.
+
+Findings:
+
+- **Tile**: 48x4 and 24x8 are the same speed (31.2 GFLOP/s at k=192, 97.9 % of the AVX2 peak, 48.9 % of the AVX-512 nominal peak). The AVX2 8x6 packed tile is 99.1 %. So there is **no throughput gain from 512-bit shape on this part, and the 512-bit-shaped tile is not leaving more than about 2 points on the table** against the 16 flop/cycle ceiling.
+- **Fringe**: a partial tile costs the same time as a full one at equal depth, so useful flop/s falls with the fraction of the tile used: 47x4 and 23x8 (one row short) 95.5 % and 93.8 % `%avx2`; 8-row and 16-row fringes about 96-97 %; fewer columns costs more (48x3 96.8 %, 48x1 45 %, 24x1 55 %); 1-row and 1x1 fringes 3-12 %. The AVX2 8x6 fringes in the `edge` group are the matching rows.
+- **End to end**: AVX-512 `gemm` 31.0-31.6 GFLOP/s (95-99 % `%avx2`) against 29.7-30.5 (94-96 %) for forced AVX2: **3.3-4.7 % faster at the five square-ish shapes** on both core types. The tile alone does not explain it (the AVX-512 tile is slower than the AVX2 tile); that is a driver-level difference I did not isolate.
+- **Zen 5 vs Zen 5c**: same ordering; the c core is 0.5-1.5 % slower in ns on tiles, within the clock difference of about 0.7 %.
+
+clock GHz (measured, per run): {'2': [1.995, 1.992, 1.994], '6': [1.98, 1.979, 1.982]}
+
+| group | kernel | shape | Zen 5 ns | GFLOP/s | %avx2 | %isa | Zen 5c ns | GFLOP/s | %avx2 | %isa |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| tile | packed FINISH(replace) | k=16 | 51.3 | 29.96 | 93.9 | 93.9 | 51.7 | 29.73 | 93.9 | 93.9 |
+| tile | packed FINISH(replace) | k=64 | 196.3 | 31.30 | 98.2 | 98.2 | 197.6 | 31.09 | 98.1 | 98.1 |
+| tile | packed FINISH(replace) | k=192 | 582.9 | 31.62 | 99.1 | 99.1 | 587.1 | 31.39 | 99.2 | 99.2 |
+| tile | packed FINISH|ADD | k=192 | 582.8 | 31.63 | 99.2 | 99.2 | 586.5 | 31.43 | 99.2 | 99.2 |
+| tile | packed RESUME|FINISH|ADD | k=192 | 583.2 | 31.60 | 99.1 | 99.1 | 587.5 | 31.37 | 99.0 | 99.0 |
+| tile | packed (no FINISH: spill sums) | k=192 | 580.4 | 31.76 | 99.5 | 99.5 | 583.5 | 31.59 | 99.7 | 99.7 |
+| tile512 | avx512 48x4 replace | k=16 | 238.7 | 25.74 | 80.8 | 40.4 | 240.0 | 25.60 | 80.8 | 40.4 |
+| tile512 | avx512 48x4 replace | k=64 | 817.4 | 30.07 | 94.2 | 47.1 | 821.7 | 29.91 | 94.4 | 47.2 |
+| tile512 | avx512 48x4 replace | k=192 | 2362.3 | 31.21 | 97.8 | 48.9 | 2376.8 | 31.02 | 98.0 | 49.0 |
+| tile512 | avx512 48x4 accumulate | k=192 | 2362.1 | 31.21 | 97.9 | 48.9 | 2376.2 | 31.03 | 98.0 | 49.0 |
+| tile512 | avx512 48x4 fringe | 48x4 k=192 | 2372.6 | 31.08 | 97.4 | 48.7 | 2388.6 | 30.87 | 97.4 | 48.7 |
+| tile512 | avx512 48x4 fringe | 47x4 k=192 | 2370.3 | 30.46 | 95.5 | 47.7 | 2386.3 | 30.25 | 95.5 | 47.7 |
+| tile512 | avx512 48x4 fringe | 32x4 k=192 | 1581.3 | 31.08 | 97.4 | 48.7 | 1592.3 | 30.87 | 97.5 | 48.8 |
+| tile512 | avx512 48x4 fringe | 16x4 k=192 | 803.6 | 30.58 | 96.0 | 48.0 | 808.1 | 30.41 | 96.1 | 48.0 |
+| tile512 | avx512 48x4 fringe | 8x4 k=192 | 402.0 | 30.56 | 95.9 | 48.0 | 405.5 | 30.31 | 95.7 | 47.8 |
+| tile512 | avx512 48x4 fringe | 1x4 k=192 | 466.6 | 3.29 | 10.3 | 5.2 | 468.9 | 3.28 | 10.3 | 5.2 |
+| tile512 | avx512 48x4 fringe | 48x3 k=192 | 1789.9 | 30.89 | 96.8 | 48.4 | 1806.1 | 30.62 | 96.6 | 48.3 |
+| tile512 | avx512 48x4 fringe | 48x1 k=192 | 1275.4 | 14.45 | 45.3 | 22.6 | 1301.6 | 14.16 | 44.7 | 22.3 |
+| tile512 | avx512 48x4 fringe | 8x2 k=192 | 386.0 | 15.92 | 49.9 | 24.9 | 389.4 | 15.78 | 49.8 | 24.9 |
+| tile512 | avx512 48x4 fringe | 1x1 k=192 | 386.9 | 0.99 | 3.1 | 1.6 | 391.1 | 0.98 | 3.1 | 1.5 |
+| tile512 | avx512 24x8 replace | k=16 | 236.4 | 25.99 | 81.5 | 40.7 | 238.2 | 25.79 | 81.5 | 40.7 |
+| tile512 | avx512 24x8 replace | k=64 | 814.2 | 30.19 | 94.6 | 47.3 | 819.5 | 29.99 | 94.7 | 47.4 |
+| tile512 | avx512 24x8 replace | k=192 | 2361.4 | 31.22 | 97.9 | 48.9 | 2376.3 | 31.03 | 97.9 | 49.0 |
+| tile512 | avx512 24x8 accumulate | k=192 | 2362.6 | 31.21 | 97.9 | 48.9 | 2377.2 | 31.01 | 98.0 | 49.0 |
+| tile512 | avx512 24x8 fringe | 24x8 k=192 | 2361.0 | 31.23 | 97.9 | 48.9 | 2376.9 | 31.02 | 98.0 | 49.0 |
+| tile512 | avx512 24x8 fringe | 23x8 k=192 | 2361.6 | 29.92 | 93.8 | 46.9 | 2376.9 | 29.73 | 93.8 | 46.9 |
+| tile512 | avx512 24x8 fringe | 16x8 k=192 | 1577.3 | 31.16 | 97.7 | 48.8 | 1588.7 | 30.94 | 97.7 | 48.8 |
+| tile512 | avx512 24x8 fringe | 8x8 k=192 | 791.6 | 31.04 | 97.4 | 48.7 | 796.6 | 30.85 | 97.3 | 48.6 |
+| tile512 | avx512 24x8 fringe | 1x8 k=192 | 796.0 | 3.86 | 12.1 | 6.1 | 798.4 | 3.85 | 12.1 | 6.1 |
+| tile512 | avx512 24x8 fringe | 24x4 k=192 | 1184.3 | 31.13 | 97.6 | 48.8 | 1191.7 | 30.93 | 97.7 | 48.9 |
+| tile512 | avx512 24x8 fringe | 24x1 k=192 | 526.8 | 17.50 | 54.9 | 27.5 | 544.2 | 16.94 | 53.5 | 26.8 |
+| tile512 | avx512 24x8 fringe | 8x2 k=192 | 386.3 | 15.91 | 49.9 | 25.0 | 387.5 | 15.85 | 50.0 | 25.0 |
+| tile512 | avx512 24x8 fringe | 1x1 k=192 | 389.5 | 0.99 | 3.1 | 1.5 | 388.6 | 0.99 | 3.1 | 1.6 |
+| e2e | gemm Avx512 (host default) | 191x257x139 | 436506.8 | 31.26 | 98.0 | 49.0 | 439822.9 | 31.03 | 97.8 | 48.9 |
+| e2e | gemm Avx256 (forced) | 191x257x139 | 451088.9 | 30.25 | 94.8 | 94.8 | 454848.4 | 30.00 | 94.8 | 94.8 |
+| e2e | gemm Avx512 (host default) | 192x257x139 | 436570.8 | 31.42 | 98.5 | 49.2 | 440761.0 | 31.12 | 98.2 | 49.1 |
+| e2e | gemm Avx256 (forced) | 192x257x139 | 452201.0 | 30.34 | 95.1 | 95.1 | 456356.2 | 30.06 | 94.8 | 94.8 |
+| e2e | gemm Avx512 (host default) | 256x256x256 | 1066050.5 | 31.48 | 98.7 | 49.3 | 1074111.0 | 31.24 | 98.7 | 49.3 |
+| e2e | gemm Avx256 (forced) | 256x256x256 | 1116574.5 | 30.05 | 94.2 | 94.2 | 1122891.0 | 29.88 | 94.4 | 94.4 |
+| e2e | gemm Avx512 (host default) | 511x511x511 | 8481026.0 | 31.47 | 98.6 | 49.3 | 8574130.0 | 31.12 | 98.2 | 49.1 |
+| e2e | gemm Avx256 (forced) | 511x511x511 | 8768111.0 | 30.44 | 95.4 | 95.4 | 8930994.0 | 29.88 | 94.3 | 94.3 |
+| e2e | gemm Avx512 (host default) | 512x512x512 | 8509289.0 | 31.55 | 99.0 | 49.5 | 8612711.0 | 31.17 | 98.5 | 49.2 |
+| e2e | gemm Avx256 (forced) | 512x512x512 | 8803497.0 | 30.49 | 95.7 | 95.7 | 8977461.0 | 29.90 | 94.4 | 94.4 |
+| e2e | gemm Avx512 (host default) | 256x32x256 | 138217.4 | 30.35 | 95.2 | 47.6 | 139124.1 | 30.15 | 95.1 | 47.6 |
+| e2e | gemm Avx256 (forced) | 256x32x256 | 140256.2 | 29.90 | 93.7 | 93.7 | 141410.2 | 29.66 | 93.7 | 93.7 |
+| e2e | gemm Avx512 (host default) | 256x512x256 | 2128754.0 | 31.52 | 98.9 | 49.4 | 2144895.0 | 31.29 | 98.8 | 49.4 |
+| e2e | gemm Avx256 (forced) | 256x512x256 | 2198955.0 | 30.52 | 95.6 | 95.6 | 2220446.0 | 30.22 | 95.4 | 95.4 |
+| e2e | gemm Avx512 (host default) | 256x513x256 | 2148481.0 | 31.30 | 98.1 | 49.1 | 2162728.0 | 31.09 | 98.1 | 49.0 |
+| e2e | gemm Avx256 (forced) | 256x513x256 | 2225655.0 | 30.21 | 94.7 | 94.7 | 2258738.0 | 29.77 | 93.9 | 93.9 |
