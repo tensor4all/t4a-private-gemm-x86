@@ -1,9 +1,9 @@
 //! Column-major overwrite GEMM on Raptor Lake P-cores. The full 8 × 6 tiles
 //! read B in place. While their twelve accumulators are live, spare load/store
 //! bandwidth packs A for subsequent tiles.
-use super::{Accum, DEPTH_BLOCK, FINISH, MR, NR, add_rank_one, pack_lhs, pack_rhs, tile};
-use core::arch::x86_64::*;
+use super::{Accum, DEPTH_BLOCK, MR, NR, add_rank_one, pack_lhs};
 
+// Number of explicit depth steps in the full-tile loop below.
 const UNROLL: usize = 8;
 const COMPUTE: usize = 0;
 const PACK_PANEL: usize = 1;
@@ -33,57 +33,70 @@ pub(super) unsafe fn multiply(
 ) -> bool {
 	// Handle one arithmetic group and its optional terminal rank-one update.
 	// The general driver owns accumulation across multiple complete groups.
-	if k < UNROLL || k > DEPTH_BLOCK + 1 || alpha != 1.0 || beta != Accum::Replace {
+	if m < MR || k < UNROLL || k > DEPTH_BLOCK + 1 || alpha != 1.0 || beta != Accum::Replace {
 		return false;
 	}
 	let depth = k.min(DEPTH_BLOCK);
 	let pitch = MR * depth;
-	if depth * NR > l1 * 2 / 3 || pitch > alen || depth * NR > blen {
+	if depth * NR > l1 * 2 / 3 || pitch > alen {
 		return false;
+	}
+	// With just one or two residual rows a padded eight-row tile wastes
+	// most of its FMAs. Pack those rows densely for the last row block.
+	let fringe = m % MR;
+	let tail = if m >= 2 * MR && fringe <= MR / 4 { fringe } else { 0 };
+	let body = m - tail;
+	if tail * depth > blen {
+		return false;
+	}
+	if tail != 0 {
+		for p in 0..depth {
+			core::ptr::copy_nonoverlapping(a.add(body + p * lda), pb.add(p * tail), tail);
+		}
 	}
 	let ways = crate::cache::CACHE_INFO[1].associativity;
 	let ways_room = if ways >= 4 { l2 / ways } else { 0 };
 	let block_rows = ((l2 / 2 - ways_room) / pitch).max(1).min(alen / pitch) * MR;
-	let two_buffers = m > block_rows && n / NR > UNROLL && block_rows <= alen / depth / 2;
+	// End an incomplete M tile with a full, overlapping overwrite tile.
+	// This also avoids repacking B for every column tile when A fits in L2.
+	let block_rows = block_rows.min(body / MR * MR);
+	let two_buffers = body > block_rows && n / NR > UNROLL && block_rows <= alen / depth / 2;
 	let full_cols = n / NR * NR;
 	let stage_from = full_cols.saturating_sub(UNROLL * NR);
 	let row_bounds = |start: usize| {
-		let len = (m - start).min(block_rows);
+		let len = (body - start).min(block_rows);
 		// Overwrite produces the same dot on overlapping rows. Let a short
 		// final block end with a complete tile when it has a predecessor.
-		let overlap = if start >= MR && len > 0 { (MR - len % MR) % MR } else { 0 };
+		let overlap = (MR - len % MR) % MR;
 		(start - overlap, len + overlap)
 	};
-	for start in (0..m).step_by(block_rows) {
+	for start in (0..body).step_by(block_rows) {
 		let (i0, rows) = row_bounds(start);
 		let slot = start / block_rows % 2;
 		let (next_i, next_rows) = if two_buffers {
-			row_bounds(start.saturating_add(block_rows).min(m))
+			row_bounds(start.saturating_add(block_rows).min(body))
 		} else {
-			(m, 0)
+			(body, 0)
 		};
 		let current = if two_buffers { pa.add(slot * block_rows * depth) } else { pa };
 		let next = if two_buffers { pa.add((1 - slot) * block_rows * depth) } else { pa };
 		let seed = (start == 0 || !two_buffers) && rows >= 2 * MR && n >= NR;
-		let full_rows = rows / MR * MR;
 		if seed {
 			pack_lhs(a.add(i0), lda, current, MR, depth);
-			if full_rows < rows {
-				pack_lhs(a.add(i0 + full_rows), lda, current.add(full_rows * depth), rows - full_rows, depth);
-			}
 		} else if start == 0 || !two_buffers {
 			pack_lhs(a.add(i0), lda, current, rows, depth);
 		}
 		if next_rows != 0 {
-			let next_full = next_rows / MR * MR;
-			if next_full < next_rows {
-				pack_lhs(a.add(next_i + next_full), lda, next.add(next_full * depth), next_rows - next_full, depth);
-			}
-			for i in (0..next_full).step_by(MR) {
+			for i in (0..next_rows).step_by(MR) {
 				for p in (depth / UNROLL * UNROLL)..depth {
 					core::ptr::copy_nonoverlapping(a.add(next_i + i + p * lda), next.add(i * depth + p * MR), MR);
 				}
 			}
+		}
+		let joint = tail != 0 && i0 + rows == body;
+		let regular = rows - if joint { MR } else { 0 };
+		if joint && seed {
+			pack_lhs(a.add(body - MR), lda, current.add(regular * depth), MR, depth);
 		}
 		for j in (0..n).step_by(NR) {
 			let width = (n - j).min(NR);
@@ -94,15 +107,16 @@ pub(super) unsafe fn multiply(
 			} else {
 				None
 			};
-			let done = if width == NR {
-				let full = rows / MR;
+			if width == NR {
+				let columns = core::array::from_fn(|j| right.add(j * ldb));
+				let full = regular / MR;
 				let staged = if next_rows >= MR && j >= stage_from {
 					let count = next_rows / MR;
 					let p = (j - stage_from) / NR * (depth / UNROLL);
 					panels::<PACK_SLAB>(
 						depth,
 						current,
-						right,
+						&columns,
 						out,
 						ldb,
 						ldc,
@@ -115,7 +129,19 @@ pub(super) unsafe fn multiply(
 					count
 				} else if seed && j == 0 {
 					let count = full - 1;
-					panels::<PACK_PANEL>(depth, current, right, out, ldb, ldc, count, a.add(i0 + MR), lda, current.add(pitch), rank);
+					panels::<PACK_PANEL>(
+						depth,
+						current,
+						&columns,
+						out,
+						ldb,
+						ldc,
+						count,
+						a.add(i0 + MR),
+						lda,
+						current.add(pitch),
+						rank,
+					);
 					count
 				} else {
 					0
@@ -125,7 +151,7 @@ pub(super) unsafe fn multiply(
 					panels::<COMPUTE>(
 						depth,
 						current.add(row * depth),
-						right,
+						&columns,
 						out.add(row),
 						ldb,
 						ldc,
@@ -136,46 +162,82 @@ pub(super) unsafe fn multiply(
 						rank.map(|(left, right)| (left.add(row), right)),
 					);
 				}
-				full * MR
 			} else {
 				match width {
-					1 => narrow_columns::<1, 6>(current, right, out, depth, ldb, ldc, rows),
-					2 => narrow_columns::<2, 3>(current, right, out, depth, ldb, ldc, rows),
-					3 => narrow_columns::<3, 2>(current, right, out, depth, ldb, ldc, rows),
-					4 => narrow_columns::<4, 1>(current, right, out, depth, ldb, ldc, rows),
-					5 => narrow_columns::<5, 1>(current, right, out, depth, ldb, ldc, rows),
+					1 => narrow_columns::<1, 6>(current, right, out, depth, ldb, ldc, regular),
+					2 => narrow_columns::<2, 3>(current, right, out, depth, ldb, ldc, regular),
+					3 => narrow_columns::<3, 2>(current, right, out, depth, ldb, ldc, regular),
+					4 => narrow_columns::<4, 1>(current, right, out, depth, ldb, ldc, regular),
+					5 => narrow_columns::<5, 1>(current, right, out, depth, ldb, ldc, regular),
 					_ => unreachable!(),
 				}
-			};
-			if done < rows {
-				pack_rhs(right, ldb, pb, width, depth);
-				for i in (done..rows).step_by(MR) {
-					let height = (rows - i).min(MR);
-					let mut edge = [[0.0; MR]; NR];
-					tile(
-						current.add(i * depth),
-						pb,
-						edge.as_mut_ptr().cast(),
-						MR * 8,
-						depth,
-						alpha,
-						core::ptr::null_mut(),
-						FINISH,
-					);
-					for (col, panel) in edge[..width].iter().enumerate() {
-						core::ptr::copy_nonoverlapping(panel.as_ptr(), out.add(i + col * ldc), height);
-					}
+				if let Some((left, rhs)) = rank {
+					add_rank_one(regular, width, left, rhs, ldb, out, ldc, alpha);
 				}
 			}
-			if let Some((left, rhs)) = rank {
-				let first = if width == NR { done } else { 0 };
-				if first < rows {
-					add_rank_one(rows - first, width, left.add(first), rhs, ldb, out.add(first), ldc, alpha);
+			if joint {
+				let packed = current.add(regular * depth);
+				let last = rank.map(|(_, b)| (a.add(body - MR + depth * lda), b));
+				for at in (0..width).step_by(3) {
+					let b = right.add(at * ldb);
+					let c = out.add(regular + at * ldc);
+					let end = last.map(|(a, b)| (a, b.add(at * ldb)));
+					match (tail, (width - at).min(3)) {
+						(1, 1) => joint_rows::<1, 1>(depth, packed, pb, b, ldb, c, ldc, end),
+						(1, 2) => joint_rows::<1, 2>(depth, packed, pb, b, ldb, c, ldc, end),
+						(1, 3) => joint_rows::<1, 3>(depth, packed, pb, b, ldb, c, ldc, end),
+						(2, 1) => joint_rows::<2, 1>(depth, packed, pb, b, ldb, c, ldc, end),
+						(2, 2) => joint_rows::<2, 2>(depth, packed, pb, b, ldb, c, ldc, end),
+						(2, 3) => joint_rows::<2, 3>(depth, packed, pb, b, ldb, c, ldc, end),
+						_ => unreachable!(),
+					}
 				}
 			}
 		}
 	}
 	true
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn joint_rows<const R: usize, const W: usize>(
+	depth: usize,
+	packed: *const f64,
+	tail: *const f64,
+	b: *const f64,
+	ldb: usize,
+	c: *mut f64,
+	ldc: usize,
+	rank: Option<(*const f64, *const f64)>,
+) {
+	let mut full = [[0.0; MR]; W];
+	let mut extra = [[0.0; W]; R];
+	for p in 0..depth {
+		let right: [f64; W] = core::array::from_fn(|j| *b.add(p + j * ldb));
+		accumulate(&mut full, &*packed.add(p * MR).cast::<[f64; MR]>(), &right);
+		for (r, sums) in extra.iter_mut().enumerate() {
+			let l = *tail.add(p * R + r);
+			for (sum, &v) in sums.iter_mut().zip(&right) {
+				*sum = l.mul_add(v, *sum);
+			}
+		}
+	}
+	for (j, col) in full.iter().enumerate() {
+		let dst = c.add(j * ldc);
+		if let Some((left, right)) = rank {
+			let v = *right.add(j * ldb);
+			for (i, &sum) in col.iter().enumerate() {
+				dst.add(i).write((*left.add(i)).mul_add(v, 0.0) + sum);
+			}
+			for (r, row) in extra.iter().enumerate() {
+				dst.add(MR + r).write((*left.add(MR + r)).mul_add(v, 0.0) + row[j]);
+			}
+		} else {
+			core::ptr::copy_nonoverlapping(col.as_ptr(), dst, MR);
+			for (r, row) in extra.iter().enumerate() {
+				dst.add(MR + r).write(row[j]);
+			}
+		}
+	}
 }
 
 /// Consume complete packed A panels while keeping only valid output columns live.
@@ -188,85 +250,62 @@ unsafe fn narrow_columns<const COLS: usize, const PANELS: usize>(
 	ldb: usize,
 	ldc: usize,
 	rows: usize,
-) -> usize {
-	use core::arch::x86_64::*;
+) {
 	let group = MR * PANELS;
-	let complete = rows / group * group;
-	for i in (0..complete).step_by(group) {
-		let mut sums = [[[_mm256_setzero_pd(); 2]; PANELS]; COLS];
+	let bulk = rows / group * group;
+	narrow_groups::<COLS, PANELS>(a, b, c, depth, ldb, ldc, bulk);
+	if bulk < rows {
+		narrow_groups::<COLS, 1>(a.add(bulk * depth), b, c.add(bulk), depth, ldb, ldc, rows - bulk);
+	}
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn narrow_groups<const COLS: usize, const PANELS: usize>(
+	a: *const f64,
+	b: *const f64,
+	c: *mut f64,
+	depth: usize,
+	ldb: usize,
+	ldc: usize,
+	rows: usize,
+) {
+	let group = MR * PANELS;
+	for i in (0..rows).step_by(group) {
+		let mut sums = [[[0.0; MR]; COLS]; PANELS];
 		for p in 0..depth {
-			let factors: [__m256d; COLS] = core::array::from_fn(|j| _mm256_set1_pd(*b.add(j * ldb + p)));
-			for t in 0..PANELS {
-				let ap = a.add((i + t * MR) * depth + p * MR);
-				let low = _mm256_loadu_pd(ap);
-				let high = _mm256_loadu_pd(ap.add(4));
-				for j in 0..COLS {
-					sums[j][t][0] = _mm256_fmadd_pd(low, factors[j], sums[j][t][0]);
-					sums[j][t][1] = _mm256_fmadd_pd(high, factors[j], sums[j][t][1]);
-				}
+			let right = core::array::from_fn(|j| *b.add(p + j * ldb));
+			for (t, panel) in sums.iter_mut().enumerate() {
+				let left = &*a.add((i + t * MR) * depth + p * MR).cast::<[f64; MR]>();
+				accumulate(panel, left, &right);
 			}
 		}
-		for j in 0..COLS {
-			for t in 0..PANELS {
-				let dest = c.add(i + j * ldc + t * MR);
-				_mm256_storeu_pd(dest, sums[j][t][0]);
-				_mm256_storeu_pd(dest.add(4), sums[j][t][1]);
+		for (t, panel) in sums.iter().enumerate() {
+			for (j, col) in panel.iter().enumerate() {
+				core::ptr::copy_nonoverlapping(col.as_ptr(), c.add(i + t * MR + j * ldc), MR);
 			}
 		}
 	}
-	complete
 }
 
-macro_rules! accumulate_8x6 {
-	($depth:literal) => {
-		concat!(
-			"vmovupd ymm12, [{a} + 64*(",
-			$depth,
-			")]\n",
-			"vmovupd ymm13, [{a} + 64*(",
-			$depth,
-			") + 32]\n",
-			"vbroadcastsd ymm14, [{b0} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vbroadcastsd ymm15, [{b1} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vfmadd231pd ymm0, ymm12, ymm14\n",
-			"vfmadd231pd ymm1, ymm13, ymm14\n",
-			"vbroadcastsd ymm14, [{b2} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vfmadd231pd ymm2, ymm12, ymm15\n",
-			"vfmadd231pd ymm3, ymm13, ymm15\n",
-			"vbroadcastsd ymm15, [{b3} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vfmadd231pd ymm4, ymm12, ymm14\n",
-			"vfmadd231pd ymm5, ymm13, ymm14\n",
-			"vbroadcastsd ymm14, [{b4} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vfmadd231pd ymm6, ymm12, ymm15\n",
-			"vfmadd231pd ymm7, ymm13, ymm15\n",
-			"vbroadcastsd ymm15, [{b5} + {idx} + 8*(",
-			$depth,
-			")]\n",
-			"vfmadd231pd ymm8, ymm12, ymm14\n",
-			"vfmadd231pd ymm9, ymm13, ymm14\n",
-			"vfmadd231pd ymm10, ymm12, ymm15\n",
-			"vfmadd231pd ymm11, ymm13, ymm15\n",
-		)
-	};
+/// Each output follows the same increasing-depth FMA chain. Lanes in a
+/// column are independent and can be vectorized together.
+#[inline(always)]
+fn accumulate<const COLS: usize>(sums: &mut [[f64; MR]; COLS], left: &[f64; MR], right: &[f64; COLS]) {
+	for (col, &r) in sums.iter_mut().zip(right) {
+		for (sum, &l) in col.iter_mut().zip(left) {
+			*sum = l.mul_add(r, *sum);
+		}
+	}
 }
 
 /// The hot loop is shared by all three packing modes. Slab mode copies
 /// one source row fragment per unrolled group, completing a panel in eight column tiles.
+#[inline(never)]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn panels<const MODE: usize>(
 	k: usize,
 	packed: *const f64,
-	b: *const f64,
+	columns: &[*const f64; NR],
 	out: *mut f64,
 	ldb: usize,
 	ldc: usize,
@@ -277,112 +316,55 @@ unsafe fn panels<const MODE: usize>(
 	rank: Option<(*const f64, *const f64)>,
 ) {
 	let bulk = k / UNROLL * UNROLL;
-	let b = b.wrapping_add(bulk);
+	let rank = rank.map(|(a, b)| {
+		let values: [f64; NR] = core::array::from_fn(|j| *b.add(j * ldb));
+		(a, values)
+	});
 	for panel in 0..panels {
 		let a = packed.add(panel * MR * k);
 		let c = out.add(panel * MR);
-		let v0: __m256d;
-		let v1: __m256d;
-		let v2: __m256d;
-		let v3: __m256d;
-		let v4: __m256d;
-		let v5: __m256d;
-		let v6: __m256d;
-		let v7: __m256d;
-		let v8: __m256d;
-		let v9: __m256d;
-		let v10: __m256d;
-		let v11: __m256d;
-
-		macro_rules! dot { ($step_copy:expr, $block_copy:expr, $tail_copy:expr; $($operands:tt)*) => {{
-core::arch::asm!(
-            "vxorpd ymm0, ymm0, ymm0",
-            "vxorpd ymm1, ymm1, ymm1",
-            "vxorpd ymm2, ymm2, ymm2",
-            "vxorpd ymm3, ymm3, ymm3",
-            "vxorpd ymm4, ymm4, ymm4",
-            "vxorpd ymm5, ymm5, ymm5",
-            "vxorpd ymm6, ymm6, ymm6",
-            "vxorpd ymm7, ymm7, ymm7",
-            "vxorpd ymm8, ymm8, ymm8",
-            "vxorpd ymm9, ymm9, ymm9",
-            "vxorpd ymm10, ymm10, ymm10",
-            "vxorpd ymm11, ymm11, ymm11",
-            ".p2align 5",
-            "2:",
-            ".irp q,0,1,2,3,4,5,6,7",
-            accumulate_8x6!("\\q"),
-            $step_copy,
-            ".endr",
-            $block_copy,
-            "add {a}, 512",
-            "add {idx}, 64",
-            "jnz 2b",
-            "test {tail}, {tail}",
-            "jz 4f",
-            "3:",
-            accumulate_8x6!("0"),
-            $tail_copy,
-            "add {a},64",
-            "add {idx},8",
-            "dec {tail}",
-            "jnz 3b",
-            "4:",
-            $($operands)*
-            a=inout(reg) a=>_,idx=inout(reg) (-(bulk as isize)*8)=>_,tail=inout(reg) (k-bulk)=>_,
-            b0=in(reg) b,
-            b1=in(reg) b.wrapping_add(ldb),
-            b2=in(reg) b.wrapping_add(2*ldb),
-            b3=in(reg) b.wrapping_add(3*ldb),
-            b4=in(reg) b.wrapping_add(4*ldb),
-            b5=in(reg) b.wrapping_add(5*ldb),
-            out("ymm0") v0, out("ymm1") v1, out("ymm2") v2, out("ymm3") v3, out("ymm4") v4, out("ymm5") v5, out("ymm6") v6, out("ymm7") v7, out("ymm8") v8, out("ymm9") v9, out("ymm10") v10, out("ymm11") v11,
-            out("ymm12") _,out("ymm13") _,out("ymm14") _,out("ymm15") _,options(nostack),
-        );
-        }}; }
-
-		macro_rules! copy_line {
-			($offset:literal) => {
-				concat!(
-					"vmovupd ymm12,[{src}]\nvmovupd ymm13,[{src}+32]\n",
-					"vmovupd [{dst}+",
-					$offset,
-					"],ymm12\nvmovupd [{dst}+",
-					$offset,
-					"+32],ymm13\n",
-					"add {src},{stride}"
-				)
-			};
-		}
-		if MODE == COMPUTE {
-			dot!("", "", "";);
-		} else {
-			let src = source.add(panel * MR);
-			let dst = destination.add(panel * MR * k);
-			if MODE == PACK_PANEL {
-				dot!(copy_line!("64*\\q"), "add {dst},512", concat!(copy_line!("0"), "\nadd {dst},64");
-                    src=inout(reg) src=>_, dst=inout(reg) dst=>_, stride=in(reg) (lda * 8),);
-			} else {
-				dot!("", concat!(copy_line!("0"), "\nadd {dst},64"), "";
-                    src=inout(reg) src=>_, dst=inout(reg) dst=>_, stride=in(reg) (lda * 8),);
-			}
-		}
-		let mut cols = [[v0, v1], [v2, v3], [v4, v5], [v6, v7], [v8, v9], [v10, v11]];
-		if let Some((rank_a, rank_b)) = rank {
-			let src = rank_a.add(panel * MR);
-			let left = [_mm256_loadu_pd(src), _mm256_loadu_pd(src.add(4))];
-			for (j, col) in cols.iter_mut().enumerate() {
-				let right = _mm256_set1_pd(*rank_b.add(j * ldb));
-				for (val, a) in col.iter_mut().zip(left) {
-					let product = _mm256_fmadd_pd(a, right, _mm256_setzero_pd());
-					*val = _mm256_add_pd(product, *val);
+		let src = source.wrapping_add(panel * MR);
+		let dst = destination.wrapping_add(panel * MR * k);
+		let mut cols = [[0.0_f64; MR]; NR];
+		macro_rules! step {
+			($index:expr) => {{
+				let p = $index;
+				let left = &*a.add(p * MR).cast::<[f64; MR]>();
+				let right = core::array::from_fn(|j| *columns[j].add(p));
+				accumulate(&mut cols, left, &right);
+				if MODE == PACK_PANEL {
+					core::ptr::copy_nonoverlapping(src.add(p * lda), dst.add(p * MR), MR);
 				}
-			}
+			}};
 		}
-		for (j, col) in cols.into_iter().enumerate() {
-			let dst = c.add(j * ldc);
-			_mm256_storeu_pd(dst, col[0]);
-			_mm256_storeu_pd(dst.add(4), col[1]);
+		for p in (0..bulk).step_by(UNROLL) {
+			// Keep one branch per packing group, including in fat-LTO builds.
+			step!(p);
+			step!(p + 1);
+			step!(p + 2);
+			step!(p + 3);
+			if MODE == PACK_SLAB {
+				let i = p / UNROLL;
+				core::ptr::copy_nonoverlapping(src.add(i * lda), dst.add(i * MR), MR);
+			}
+			step!(p + 4);
+			step!(p + 5);
+			step!(p + 6);
+			step!(p + 7);
+		}
+		for p in bulk..k {
+			step!(p);
+		}
+		if let Some((rank_a, right)) = &rank {
+			let left = &*rank_a.add(panel * MR).cast::<[f64; MR]>();
+			for (j, (col, &r)) in cols.iter().zip(right).enumerate() {
+				let updated: [f64; MR] = core::array::from_fn(|i| left[i].mul_add(r, 0.) + col[i]);
+				core::ptr::copy_nonoverlapping(updated.as_ptr(), c.add(j * ldc), MR);
+			}
+		} else {
+			for (j, col) in cols.iter().enumerate() {
+				core::ptr::copy_nonoverlapping(col.as_ptr(), c.add(j * ldc), MR);
+			}
 		}
 	}
 }
@@ -397,7 +379,18 @@ mod tests {
 			return;
 		}
 		let sentinel = 73.0_f64;
-		for (m, k, n) in [(67, 257, 55), (81, 511, 57), (65, 512, 58), (73, 513, 59), (47, 135, 24)] {
+		for (m, k, n) in [
+			(9, 8, 1),
+			(18, 65, 37),
+			(66, 513, 61),
+			(39, 63, 25),
+			(63, 65, 61),
+			(67, 257, 55),
+			(81, 511, 57),
+			(65, 512, 58),
+			(73, 513, 59),
+			(47, 135, 24),
+		] {
 			let (lda, ldb, ldc) = (m + 3, k + 1, m + 5);
 			let a: Vec<_> = (0..lda * k).map(|i| (f64::from((i * 19 % 127) as u32) - 62.) / 17.).collect();
 			let b: Vec<_> = (0..ldb * n).map(|i| (f64::from((i * 23 % 103) as u32) - 51.) / 13.).collect();
@@ -427,7 +420,10 @@ mod tests {
 			};
 			let (alen, blen) = (pa.len(), pb.len());
 			assert!(!run(&mut c, 0, blen, &mut pa, &mut pb));
-			assert!(!run(&mut c, alen, 0, &mut pa, &mut pb));
+			if m >= 2 * MR && (1..=MR / 4).contains(&(m % MR)) {
+				assert!(!run(&mut c, alen, (m % MR) * k.min(DEPTH_BLOCK) - 1, &mut pa, &mut pb));
+			}
+
 			assert!(c.iter().all(|&x| x == sentinel));
 			assert!(run(&mut c, alen, blen, &mut pa, &mut pb));
 			assert_eq!(c[0], sentinel);
