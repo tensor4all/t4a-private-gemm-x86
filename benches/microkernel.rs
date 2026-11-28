@@ -125,6 +125,10 @@ fn sh(cmd: &str) -> String {
 		.unwrap_or_default()
 }
 
+extern "C" {
+	fn sched_getcpu() -> i32;
+}
+
 fn main() {
 	if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
 		println!("SKIP: no AVX2+FMA");
@@ -134,12 +138,29 @@ fn main() {
 	let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
 	let want = |g: &str| filter.is_empty() || filter.iter().any(|f| g.starts_with(f.as_str()));
 
+	// Verify the pin instead of trusting it: exactly one allowed CPU, and record what the kernel
+	// says about that CPU (L3 size and sharing group distinguish Zen 5 from Zen 5c).
+	let allowed = sh("grep Cpus_allowed_list /proc/self/status | cut -f2");
+	let cpu: usize = match allowed.parse() {
+		Ok(c) => c,
+		Err(_) => {
+			eprintln!("REFUSING TO RUN: affinity is '{allowed}', not a single CPU. Use taskset -c <cpu>.");
+			std::process::exit(2);
+		}
+	};
+	let sys = |f: &str| sh(&format!("cat /sys/devices/system/cpu/cpu{cpu}/{f} 2>/dev/null"));
+	let core_line = format!(
+		"cpu{cpu} (smt sibling {}), L3 {} shared by {}, L2 {}",
+		sys("topology/thread_siblings_list"), sys("cache/index3/size"), sys("cache/index3/shared_cpu_list"), sys("cache/index2/size")
+	);
 	let measured = calibrate_ghz();
 	let ghz = std::env::var("BENCH_GHZ").ok().and_then(|s| s.parse().ok()).unwrap_or(measured);
 	let (l1, l2, l3) = k::cache_elems();
 	println!("host       : {}", sh("hostname"));
 	println!("cpu        : {}", cpu_name());
-	println!("affinity   : {}", sh("grep Cpus_allowed_list /proc/self/status | cut -f2"));
+	println!("affinity   : {allowed} (verified single CPU)");
+	println!("core       : {core_line}");
+	println!("ran on cpu : {} (sched_getcpu at start)", unsafe { sched_getcpu() });
 	println!("commit     : {}", option_env!("BENCH_COMMIT").unwrap_or("unrecorded"));
 	println!("boost      : {} (1 = turbo/boost on)", sh("cat /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null | tr '\\n' ' '"));
 	println!("cache f64s : L1d {l1}  L2 {l2}  L3 {l3}");
