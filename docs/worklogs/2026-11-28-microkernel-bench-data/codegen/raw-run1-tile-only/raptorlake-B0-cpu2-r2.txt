@@ -1,0 +1,30 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 2 (verified single CPU)
+core       : cpu2 (smt sibling 2,14), L3 16384K shared by 0-3,12-15, L2 1024K
+ran on cpu : 2 (sched_getcpu at start)
+commit     : unrecorded
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 6291456
+clock      : measured 1.995 GHz (dependent-add chain), used for peak 1.995 GHz
+peak/core  : 16 flop/cycle x 1.995 GHz = 31.91 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : true   stream tile: true
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+tile     packed FINISH(replace)             k=16                     51.3     29.95    93.8%
+tile     packed FINISH(replace)             k=64                    196.5     31.27    98.0%
+tile     packed FINISH(replace)             k=192                   598.6     30.79    96.5%
+tile     packed FINISH(replace)             k=512                  1551.8     31.67    99.3%
+tile     packed FINISH|ADD                  k=192                   582.7     31.63    99.1%
+tile     packed RESUME|FINISH|ADD           k=192                   582.1     31.66    99.2%
+tile     packed (no FINISH: spill sums)     k=192                   598.2     30.81    96.6%
+tile     stream full tile (B in place)      k=64 x1panel            193.9     31.68    99.3%
+tile     stream full tile (B in place)      k=192 x1panel           578.8     31.84    99.8%
+tile     stream full tile (B in place)      k=64 x4panel            772.7     31.80    99.7%
+tile     stream full tile (B in place)      k=511 x1panel          1550.7     31.63    99.1%
+tile     stream full tile (B in place)      k=512 x1panel          1553.7     31.64    99.1%
+tile     stream full tile (B in place)      k=513 x1panel          1559.1     31.59    99.0%
+tile     stream full tile (B in place)      k=512 x4panel          6208.2     31.67    99.2%
+
+%peak = GFLOP/s / (16 flop/cycle x 1.995 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).

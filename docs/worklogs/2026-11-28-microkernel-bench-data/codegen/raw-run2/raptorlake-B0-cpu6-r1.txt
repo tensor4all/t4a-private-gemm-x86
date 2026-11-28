@@ -1,0 +1,55 @@
+host       : shinaoka-EVO-X1Pro
+cpu        : AMD Ryzen AI 9 HX 470 w/ Radeon 890M
+affinity   : 6 (verified single CPU)
+core       : cpu6 (smt sibling 6,18), L3 8192K shared by 4-11,16-23, L2 1024K
+ran on cpu : 6 (sched_getcpu at start)
+commit     : unrecorded
+boost      : 0 (1 = turbo/boost on)
+cache f64s : L1d 6144  L2 131072  L3 1572864
+clock      : measured 1.982 GHz (dependent-add chain), used for peak 1.982 GHz
+peak/core  : 16 flop/cycle x 1.982 GHz = 31.71 GFLOP/s
+method     : median of 31 samples, each >= 2ms of back-to-back calls, 100 ms warm-up
+stream drv : true   stream tile: true
+
+group    kernel                             shape                 ns/call   GFLOP/s    %peak
+tile     packed FINISH(replace)             k=16                     51.7     29.72    93.7%
+tile     packed FINISH(replace)             k=64                    197.4     31.13    98.2%
+tile     packed FINISH(replace)             k=192                   586.1     31.45    99.2%
+tile     packed FINISH(replace)             k=512                  1572.7     31.25    98.6%
+tile     packed FINISH|ADD                  k=192                   587.3     31.38    99.0%
+tile     packed RESUME|FINISH|ADD           k=192                   586.3     31.44    99.1%
+tile     packed (no FINISH: spill sums)     k=192                   583.7     31.58    99.6%
+tile     stream full tile (B in place)      k=64 x1panel            195.2     31.47    99.2%
+tile     stream full tile (B in place)      k=192 x1panel           583.1     31.61    99.7%
+tile     stream full tile (B in place)      k=64 x4panel            778.8     31.56    99.5%
+tile     stream full tile (B in place)      k=511 x1panel          1565.1     31.34    98.8%
+tile     stream full tile (B in place)      k=512 x1panel          1568.1     31.35    98.8%
+tile     stream full tile (B in place)      k=513 x1panel          1570.5     31.36    98.9%
+tile     stream full tile (B in place)      k=512 x4panel          6250.1     31.46    99.2%
+tile     stream mode COMPUTE                k=192 x1panel           585.1     31.50    99.3%
+tile     stream mode PACK_PANEL             k=192 x1panel          1629.5     11.31    35.7%
+tile     stream mode PACK_SLAB              k=192 x1panel          1358.3     13.57    42.8%
+tile     stream mode COMPUTE                k=512 x1panel          1580.9     31.09    98.0%
+tile     stream mode PACK_PANEL             k=512 x1panel          4543.8     10.82    34.1%
+tile     stream mode PACK_SLAB              k=512 x1panel          3703.6     13.27    41.8%
+tile     stream mode COMPUTE                k=512 x4panel          6266.6     31.37    98.9%
+tile     stream mode PACK_PANEL             k=512 x4panel         18785.1     10.47    33.0%
+tile     stream mode PACK_SLAB              k=512 x4panel         14748.7     13.33    42.0%
+driver   packed driver (multiply)           191x257x139          488581.4     27.93    88.1%
+driver   stream driver (stream_rhs)         191x257x139          481835.1     28.32    89.3%
+driver   packed driver (multiply)           192x257x139          494471.1     27.74    87.5%
+driver   stream driver (stream_rhs)         192x257x139          472470.1     29.03    91.6%
+driver   packed driver (multiply)           256x256x256         1163122.0     28.85    91.0%
+driver   stream driver (stream_rhs)         256x256x256         1137128.5     29.51    93.0%
+driver   packed driver (multiply)           511x511x511         8940164.0     29.85    94.1%
+driver   stream driver (stream_rhs)         511x511x511         9318990.0     28.64    90.3%
+driver   packed driver (multiply)           512x512x512         9102146.0     29.49    93.0%
+driver   stream driver (stream_rhs)         512x512x512         9367420.0     28.66    90.4%
+driver   packed driver (multiply)           256x32x256           146152.2     28.70    90.5%
+driver   stream driver (stream_rhs)         256x32x256           140039.6     29.95    94.4%
+driver   packed driver (multiply)           256x512x256         2283665.0     29.39    92.7%
+driver   stream driver (stream_rhs)         256x512x256         2453751.0     27.35    86.2%
+driver   packed driver (multiply)           256x513x256         2298732.0     29.25    92.2%
+driver   stream driver (stream_rhs)         256x513x256         2456856.0     27.37    86.3%
+
+%peak = GFLOP/s / (16 flop/cycle x 1.982 GHz); AVX2 FMA denominator for every row, including Avx512 e2e (which can exceed it).

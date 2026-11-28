@@ -158,3 +158,14 @@ clock GHz (measured, per run): {'2': [1.995, 1.992, 1.994], '6': [1.98, 1.979, 1
 | e2e | gemm Avx256 (forced) | 256x512x256 | 2198955.0 | 30.52 | 95.6 | 95.6 | 2220446.0 | 30.22 | 95.4 | 95.4 |
 | e2e | gemm Avx512 (host default) | 256x513x256 | 2148481.0 | 31.30 | 98.1 | 49.1 | 2162728.0 | 31.09 | 98.1 | 49.0 |
 | e2e | gemm Avx256 (forced) | 256x513x256 | 2225655.0 | 30.21 | 94.7 | 94.7 | 2258738.0 | 29.77 | 93.9 | 93.9 |
+
+
+## Generated code of the two tile formulations, and `-C target-cpu` (#26)
+
+Full write-up, tables, disassembly, scripts and the overlay patch (the overlay is **not** part of #26): `2026-11-28-microkernel-bench-data/codegen/` (start at its `README.md`). Summary:
+
+- #26 ships `mul_add` only in the **streamed** tile; its packed tile is the merge-base intrinsics. Config 2 (`mul_add` in the packed tile) is a local experiment, so the 1.5-6 % figure belongs to it, not to #26.
+- All inner loops use 96 packed `ymm` FMAs and 48 broadcasts per 8 depth steps, with no width collapse. The difference is register allocation: in the default build the packed `mul_add` tile routes one accumulator through the stack (4 stack accesses per iteration, 0 for intrinsics), and #26's streamed pack-mode loops spill heavily (`panels::<1>` 129, `panels::<2>` 58 stack accesses against 5 and 10 for intrinsics). The COMPUTE-mode loop is clean in both.
+- Under `-C target-cpu=znver5` the spills disappear (packed `mul_add` ÷ intrinsics 0.99-1.00); under default, `x86-64-v3` and `raptorlake` they remain (packed tile 1.02-1.09; streamed PACK_SLAB up to 2.1x). The intrinsics loops are stable in every build.
+- Hardware counters were not collected (`kernel.perf_event_paranoid` = 4, no root); instruction counts are derived from the disassembly.
+- Limits: absolute ns of identical source differs by about 2.7 % between separately built binaries, and driver times at 512^3 move 6-9 % between builds with the same hot loop, so a driver-level gap of that size cannot be assigned to the instruction stream with this evidence.

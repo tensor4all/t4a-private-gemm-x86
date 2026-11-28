@@ -1,0 +1,20 @@
+loop 2350f0..2355c1: 184 instructions per iteration
+    96 vfmadd231pd
+    48 vbroadcastsd
+    16 vmovupd
+    16 vmovups
+     4 mov
+     2 add
+     1 cmp
+     1 jne
+fma by dest width: {'ymm': 96} scalar-sd/ss FMAs: 0
+stack-relative accesses in loop: 5
+    23510e mov 0x70(%rsp),%r11
+    235281 mov 0x58(%rsp),%r11
+    235349 mov 0x60(%rsp),%r11
+    235513 mov 0x68(%rsp),%r11
+    2355a2 add 0x78(%rsp),%r14
+vbroadcastsd: 48  vpermilpd/vpermpd/vshufpd/vunpck: 0
+vector loads (vmovupd/apd from memory): 16  stores: 0
+accumulator regs written by FMA: 12  FMAs per iteration: 96
+FMAs between consecutive writes to same dest: min 4 max 20  (instructions: min 10 max 36 )
